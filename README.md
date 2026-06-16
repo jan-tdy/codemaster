@@ -35,6 +35,20 @@ pip install PyQt5 requests        # PyQt5.QtSvg is needed for SVG icons
 python3 jadiv_code_master.py
 ```
 
+### Desktop launcher
+
+To add **Jadiv Code Master** to your application menu (Linux, per-user, no root):
+
+```bash
+./install-launcher.sh             # install
+./install-launcher.sh --uninstall # remove
+```
+
+This installs `assets/codemaster.desktop` into `~/.local/share/applications/`
+(with the repo path filled in) and the icon into
+`~/.local/share/icons/hicolor/scalable/apps/`, then refreshes the desktop and
+icon caches. Look for *Jadiv Code Master* in your launcher.
+
 Code Master keeps its state in:
 
 | Path | Purpose |

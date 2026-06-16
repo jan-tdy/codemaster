@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f8cff"/>
+      <stop offset="1" stop-color="#9775fa"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#bg)"/>
+  <!-- shopping bag -->
+  <path d="M84 92 h88 a10 10 0 0 1 10 10 l8 78 a14 14 0 0 1-14 16 H80
+           a14 14 0 0 1-14-16 l8-78 a10 10 0 0 1 10-10 Z"
+        fill="#ffffff" opacity="0.95"/>
+  <path d="M104 96 v-8 a24 24 0 0 1 48 0 v8"
+        fill="none" stroke="#ffffff" stroke-width="12" stroke-linecap="round"/>
+  <!-- code brackets on the bag -->
+  <g fill="none" stroke="#4f8cff" stroke-width="11" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="116,150 100,166 116,182"/>
+    <polyline points="140,150 156,166 140,182"/>
+  </g>
+</svg>

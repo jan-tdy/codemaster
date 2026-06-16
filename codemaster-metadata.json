@@ -12,7 +12,7 @@
       "category": "Developer Tools",
       "version": "2.0.0",
       "author": "JapySoft TDY",
-      "icon": null,
+      "icon": "assets/codemaster.svg",
       "subdir": ".",
       "entrypoint": "jadiv_code_master.py",
       "run": "python3 jadiv_code_master.py",
