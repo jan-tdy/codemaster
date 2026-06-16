@@ -971,6 +971,10 @@ class CodeMaster(QMainWindow):
         safe = app["key"].replace("/", "-").replace(" ", "_")
         return APPLICATIONS_DIR / f"codemaster-{safe}.desktop"
 
+    def _launcher_icon_path(self, app):
+        safe = app["key"].replace("/", "__").replace(" ", "_")
+        return LAUNCHER_ICON_DIR / f"{safe}.png"
+
     def has_launcher(self, app):
         return self._launcher_path(app).exists()
 
@@ -998,16 +1002,18 @@ class CodeMaster(QMainWindow):
 
         # Render the app's icon to a stable PNG the .desktop file can point at.
         LAUNCHER_ICON_DIR.mkdir(parents=True, exist_ok=True)
-        icon_png = LAUNCHER_ICON_DIR / (
-            app["key"].replace("/", "__").replace(" ", "_") + ".png")
+        icon_png = self._launcher_icon_path(app)
         pm = pixmap_from_bytes(app.get("icon_data"), 128) \
             or placeholder_pixmap(app.get("name", "?"), 128)
         pm.save(str(icon_png))
 
-        # cd into the app dir then run, so relative paths inside the app resolve.
-        exec_line = f"sh -c 'cd \"{cwd}\" && {run}'"
+        # The Path key sets the working directory, so the command runs in the
+        # app folder without a fragile `sh -c 'cd …'` wrapper.
+        exec_line = run
         categories = DESKTOP_CATEGORIES.get(app.get("category", ""), "Utility;")
-        comment = app.get("tagline") or app.get("description", "")
+        # Comment must be a single line per the Desktop Entry Spec.
+        comment = (app.get("tagline")
+                   or app.get("description", "")).replace("\n", " ")
         content = (
             "[Desktop Entry]\n"
             "Type=Application\n"
@@ -1035,13 +1041,8 @@ class CodeMaster(QMainWindow):
         self._toast(f"Added '{app['name']}' to your application menu")
 
     def remove_launcher(self, app):
-        path = self._launcher_path(app)
-        if path.exists():
-            path.unlink(missing_ok=True)
-        icon_png = LAUNCHER_ICON_DIR / (
-            app["key"].replace("/", "__").replace(" ", "_") + ".png")
-        if icon_png.exists():
-            icon_png.unlink(missing_ok=True)
+        self._launcher_path(app).unlink(missing_ok=True)
+        self._launcher_icon_path(app).unlink(missing_ok=True)
         self._update_desktop_db()
         self.refresh_views()
         self._toast(f"Removed '{app['name']}' from your application menu")
@@ -1055,6 +1056,7 @@ class CodeMaster(QMainWindow):
         # Drop any desktop launcher we created for it.
         if self.has_launcher(app):
             self._launcher_path(app).unlink(missing_ok=True)
+            self._launcher_icon_path(app).unlink(missing_ok=True)
             self._update_desktop_db()
         rec = self.installed.pop(app["key"], None)
         save_installed(self.installed)
