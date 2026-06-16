@@ -16,6 +16,7 @@
       "subdir": ".",
       "entrypoint": "jadiv_code_master.py",
       "run": "python3 jadiv_code_master.py",
+      "update_method": "sync",
       "maintained": true
     }
   ]

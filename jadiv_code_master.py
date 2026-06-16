@@ -187,6 +187,18 @@ class CatalogLoader(QThread):
                     return None, None
         return None, None
 
+    def _fetch_release(self, repo):
+        """Latest published release tag for a repo, or None if it has none."""
+        url = (f"https://api.github.com/repos/{self.username}/"
+               f"{repo}/releases/latest")
+        try:
+            resp = requests.get(url, headers=self._headers(), timeout=20)
+            if resp.status_code == 200:
+                return resp.json().get("tag_name")
+        except requests.RequestException:
+            return None
+        return None
+
     def _fetch_icon(self, repo, branch, icon_path):
         if not icon_path:
             return None
@@ -210,8 +222,13 @@ class CatalogLoader(QThread):
                 meta, branch = self._fetch_metadata(repo, default_branch)
                 if not meta:
                     continue
+                release_tag = None
+                if any(a.get("update_method") == "release"
+                       for a in meta.get("apps", [])):
+                    release_tag = self._fetch_release(repo)
                 for app in meta.get("apps", []):
                     icon_data = self._fetch_icon(repo, branch, app.get("icon"))
+                    method = app.get("update_method", "sync")
                     apps.append({
                         "key": f"{repo}/{app.get('id')}",
                         "repo": repo,
@@ -229,6 +246,9 @@ class CatalogLoader(QThread):
                         "run": app.get("run", ""),
                         "requirements": app.get("requirements"),
                         "maintained": app.get("maintained", True),
+                        "update_method": method,
+                        "release_tag": release_tag if method == "release"
+                                       else None,
                         "homepage": app.get("homepage")
                                     or meta.get("homepage"),
                     })
@@ -243,7 +263,7 @@ class GitWorker(QThread):
     done = pyqtSignal(bool, str)
 
     def __init__(self, action, username, repo, repo_root, branch,
-                 req_path=None):
+                 req_path=None, method="sync", release_tag=None):
         super().__init__()
         self.action = action
         self.username = username
@@ -251,6 +271,8 @@ class GitWorker(QThread):
         self.repo_root = Path(repo_root)
         self.branch = branch
         self.req_path = req_path
+        self.method = method
+        self.release_tag = release_tag
 
     def _run(self, cmd, cwd=None):
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
@@ -258,27 +280,36 @@ class GitWorker(QThread):
             raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
         return proc.stdout
 
+    def _clone(self, ref):
+        """Fresh shallow clone of the repo at a branch or tag."""
+        url = f"https://github.com/{self.username}/{self.repo}.git"
+        if self.repo_root.exists():
+            shutil.rmtree(self.repo_root)
+        self.repo_root.parent.mkdir(parents=True, exist_ok=True)
+        cmd = ["git", "clone", "--depth", "1"]
+        if ref:
+            cmd += ["--branch", ref]
+        cmd += [url, str(self.repo_root)]
+        self._run(cmd)
+
     def run(self):
         try:
-            url = f"https://github.com/{self.username}/{self.repo}.git"
-            if self.action == "install":
-                if (self.repo_root / ".git").exists():
+            # "release" apps track a tagged GitHub release; "sync" apps track
+            # the latest code on a branch.
+            release = (self.method == "release" and self.release_tag)
+            if self.action in ("install", "update"):
+                if release:
+                    # Tags can't be fast-forwarded — re-clone at the new tag.
+                    self._clone(self.release_tag)
+                elif self.action == "install" and \
+                        not (self.repo_root / ".git").exists():
+                    self._clone(self.branch)
+                else:
                     self._run(["git", "-C", str(self.repo_root), "pull",
                                "--ff-only"])
-                else:
-                    if self.repo_root.exists():
-                        shutil.rmtree(self.repo_root)
-                    self.repo_root.parent.mkdir(parents=True, exist_ok=True)
-                    cmd = ["git", "clone", "--depth", "1"]
-                    if self.branch:
-                        cmd += ["--branch", self.branch]
-                    cmd += [url, str(self.repo_root)]
-                    self._run(cmd)
-                self.done.emit(True, "Installed")
-            elif self.action == "update":
-                self._run(["git", "-C", str(self.repo_root), "pull",
-                           "--ff-only"])
-                self.done.emit(True, "Updated")
+                self.done.emit(
+                    True, "Installed" if self.action == "install"
+                    else "Updated")
             elif self.action == "deps":
                 self._run([sys.executable, "-m", "pip", "install", "-r",
                            str(self.req_path)])
@@ -328,9 +359,14 @@ class AppCard(QFrame):
         text.addLayout(title_row)
 
         meta_bits = [self.app["category"]]
-        if self.app["version"]:
-            meta_bits.append("v" + self.app["version"])
+        version = self.store.effective_version(self.app)
+        if version:
+            meta_bits.append("v" + version)
         meta_bits.append(self.app["repo"])
+        if self.app.get("update_method") == "release":
+            meta_bits.append("↻ release")
+        else:
+            meta_bits.append("↻ latest code")
         meta = QLabel("  ·  ".join(meta_bits))
         meta.setObjectName("AppMeta")
         text.addWidget(meta)
@@ -681,15 +717,26 @@ class CodeMaster(QMainWindow):
     def is_installed(self, key):
         return key in self.installed
 
+    @staticmethod
+    def effective_version(app):
+        """The version we compare on: a release tag for 'release' apps,
+        otherwise the version declared in the metadata."""
+        if app.get("update_method") == "release" and app.get("release_tag"):
+            return str(app["release_tag"])
+        return str(app.get("version", ""))
+
     def has_update(self, app):
         rec = self.installed.get(app["key"])
         if not rec:
             return False
         catalog = next((a for a in self.catalog if a["key"] == app["key"]),
                        None)
-        if not catalog or not catalog.get("version"):
+        if not catalog:
             return False
-        return str(catalog["version"]) != str(rec.get("version", ""))
+        latest = self.effective_version(catalog)
+        if not latest:
+            return False
+        return latest != str(rec.get("version", ""))
 
     # -- install / update / launch --------------------------------------- #
     def _repo_root(self, app):
@@ -700,7 +747,9 @@ class CodeMaster(QMainWindow):
     def install_app(self, app):
         repo_root = APPS_DIR / app["repo"]
         worker = GitWorker("install", self.config["username"], app["repo"],
-                           repo_root, app.get("branch", self.config["branch"]))
+                           repo_root, app.get("branch", self.config["branch"]),
+                           method=app.get("update_method", "sync"),
+                           release_tag=app.get("release_tag"))
 
         def finished(ok, msg):
             self._workers.discard(worker)
@@ -709,9 +758,11 @@ class CodeMaster(QMainWindow):
                 return
             self.installed[app["key"]] = {
                 "name": app["name"], "repo": app["repo"],
-                "category": app["category"], "version": app["version"],
+                "category": app["category"],
+                "version": self.effective_version(app),
                 "subdir": app.get("subdir", "."), "run": app.get("run", ""),
                 "requirements": app.get("requirements"),
+                "update_method": app.get("update_method", "sync"),
                 "repo_root": str(repo_root), "source": "store",
             }
             save_installed(self.installed)
@@ -725,22 +776,26 @@ class CodeMaster(QMainWindow):
 
     def update_app(self, app):
         repo_root = self._repo_root(app)
+        catalog = next((a for a in self.catalog if a["key"] == app["key"]),
+                       None) or app
         worker = GitWorker("update", self.config["username"], app["repo"],
-                           repo_root, app.get("branch", self.config["branch"]))
+                           repo_root, app.get("branch", self.config["branch"]),
+                           method=catalog.get("update_method", "sync"),
+                           release_tag=catalog.get("release_tag"))
 
         def finished(ok, msg):
             self._workers.discard(worker)
             if not ok:
                 QMessageBox.warning(self, "Update failed", msg)
                 return
-            # A pull refreshes the whole clone, so every installed app from
-            # this repo is now up to date — sync all their versions.
+            # Refreshing the clone updates every installed app from this repo —
+            # sync each one's stored version to the freshly installed one.
             for key, inst in list(self.installed.items()):
                 if inst.get("repo") == app["repo"]:
                     cat = next((a for a in self.catalog
                                 if a["key"] == key), None)
                     if cat:
-                        inst["version"] = cat["version"]
+                        inst["version"] = self.effective_version(cat)
             save_installed(self.installed)
             self.refresh_views()
             self._toast(f"Updated {app['name']}")

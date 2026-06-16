@@ -70,6 +70,7 @@ file in its **root**. One repo, one metadata file, any number of apps:
       "entrypoint": "devcontrol.py",
       "run": "python3 devcontrol.py",
       "requirements": "requirements.txt",
+      "update_method": "sync",
       "maintained": true
     }
   ]
@@ -95,7 +96,21 @@ file in its **root**. One repo, one metadata file, any number of apps:
 | `apps[].entrypoint` | no | Main script, relative to `subdir`. |
 | `apps[].run` | no | Command to launch the app, run from `subdir`. |
 | `apps[].requirements` | no | Requirements file, relative to `subdir`. |
+| `apps[].update_method` | no | How the app updates — see below. Default `sync`. |
 | `apps[].maintained` | no | `false` shows an *unmaintained* badge. |
+
+### `update_method`
+
+Each app declares how Code Master should keep it up to date:
+
+| Value | Meaning |
+|-------|---------|
+| `sync` *(default)* | **Replace it with the latest code.** Code Master tracks the metadata branch and `git pull`s the newest commits. The displayed version is the metadata `version`, and an update is offered when that string changes. |
+| `release` | **Download the latest release.** Code Master reads the repo's latest GitHub *release* (`releases/latest`), installs the code at that tag, and offers an update when a newer release tag is published. The displayed version is the release tag. |
+
+Use `release` for apps that cut tagged releases (e.g. JadivCalc, which already
+checks GitHub release tags from inside the app); use `sync` for apps that are
+meant to always run the newest code on the branch.
 
 The icon and metadata are fetched from the **metadata branch** configured in
 Settings (default `main`), so merge your `codemaster-metadata.json` into that
