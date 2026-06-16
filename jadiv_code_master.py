@@ -27,7 +27,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QTextEdit, QLineEdit, QLabel, QScrollArea, QFrame, QGridLayout,
     QSizePolicy, QFileDialog, QMessageBox, QCheckBox, QFormLayout
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QProcess
 from PyQt5.QtGui import QPixmap, QColor, QPainter, QFont
 
 APP_NAME = "Jadiv Code Master"
@@ -57,9 +57,18 @@ def _read_json(path, default):
 
 
 def _write_json(path, data):
+    # Write to a sibling temp file and atomically replace, so a crash mid-write
+    # can never leave a half-written (corrupt) config behind.
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, ensure_ascii=False)
+    temp_path = path.with_suffix(".tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+        temp_path.replace(path)
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
 
 
 def load_config():
@@ -554,11 +563,12 @@ class CodeMaster(QMainWindow):
         self.code_editor.setPlaceholderText("Write or paste Python code here…")
         lay.addWidget(self.code_editor)
 
-        run_btn = QPushButton("Run code")
-        run_btn.setObjectName("Primary")
-        run_btn.setCursor(Qt.PointingHandCursor)
-        run_btn.clicked.connect(self.run_code)
-        lay.addWidget(run_btn, alignment=Qt.AlignLeft)
+        self.run_btn = QPushButton("Run code")
+        self.run_btn.setObjectName("Primary")
+        self.run_btn.setCursor(Qt.PointingHandCursor)
+        self.run_btn.clicked.connect(self.run_code)
+        lay.addWidget(self.run_btn, alignment=Qt.AlignLeft)
+        self._runner_process = None
 
         lay.addWidget(QLabel("Output:"))
         self.code_output = QTextEdit()
@@ -926,19 +936,42 @@ class CodeMaster(QMainWindow):
 
     # -- code runner ------------------------------------------------------ #
     def run_code(self):
+        # If something is already running, this click stops it.
+        if self._runner_process and \
+                self._runner_process.state() != QProcess.NotRunning:
+            self._runner_process.kill()
+            return
+
         code = self.code_editor.toPlainText()
         temp_file = os.path.join(DATA_DIR, "temp_code.py")
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         try:
             with open(temp_file, "w", encoding="utf-8") as fh:
                 fh.write(code)
-            proc = subprocess.run([sys.executable, temp_file],
-                                  capture_output=True, text=True, timeout=15)
-            self.code_output.setText(proc.stdout + proc.stderr)
-        except subprocess.TimeoutExpired:
-            self.code_output.setText("Execution timed out after 15 seconds.")
         except Exception as exc:  # noqa: BLE001
             self.code_output.setText(str(exc))
+            return
+
+        # Run asynchronously via QProcess so a long-running or infinite loop
+        # never freezes the GUI; output streams in as it is produced.
+        self.code_output.setText("Running…\n")
+        self.run_btn.setText("Stop")
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        proc.readyRead.connect(
+            lambda: self.code_output.insertPlainText(
+                bytes(proc.readAll()).decode("utf-8", errors="replace")))
+        proc.finished.connect(lambda *_: self._on_code_finished())
+        proc.errorOccurred.connect(
+            lambda *_: self.code_output.insertPlainText(
+                f"\n[process error: {proc.errorString()}]"))
+        self._runner_process = proc
+        proc.start(sys.executable, [temp_file])
+
+    def _on_code_finished(self):
+        self.run_btn.setText("Run code")
+        self._runner_process = None
+        self._toast("Execution finished")
 
     # -- misc ------------------------------------------------------------- #
     def _toast(self, message):

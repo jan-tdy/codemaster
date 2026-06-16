@@ -41,19 +41,19 @@ do_install() {
         echo "Error: python3 is not installed." >&2
         exit 1
     fi
-    if ! python3 -c "import PyQt5" >/dev/null 2>&1; then
-        echo "Warning: PyQt5 is not installed. Install it with:" >&2
+    if ! python3 -c "import PyQt5, requests" >/dev/null 2>&1; then
+        echo "Warning: PyQt5 or requests is not installed. Install them with:" >&2
         echo "    pip install PyQt5 requests" >&2
     fi
 
     mkdir -p "$APP_DIR" "$ICON_DIR"
     install -m 0644 "$ASSETS_DIR/$ICON_NAME" "$ICON_DIR/$ICON_NAME"
 
-    # Substitute the placeholder with the real repo path.
-    local escaped_repo_dir
-    escaped_repo_dir=$(printf '%s\n' "$REPO_DIR" | sed 's/[&|\]/\\&/g')
-    sed "s|__INSTALL_DIR__|$escaped_repo_dir|g" \
-        "$ASSETS_DIR/$DESKTOP_FILE" > "$APP_DIR/$DESKTOP_FILE"
+    # Substitute the placeholder with the real repo path. python3 (verified
+    # above) does a literal replacement that is safe for any characters in the
+    # path — spaces, backslashes, ampersands, etc.
+    python3 -c 'import sys; sys.stdout.write(sys.stdin.read().replace("__INSTALL_DIR__", sys.argv[1]))' \
+        "$REPO_DIR" < "$ASSETS_DIR/$DESKTOP_FILE" > "$APP_DIR/$DESKTOP_FILE"
     chmod 0644 "$APP_DIR/$DESKTOP_FILE"
 
     update_caches
