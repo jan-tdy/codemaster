@@ -16,15 +16,24 @@ publishes the Telescope Cover, Astrofoto, Atacama (C14) and DSLR apps.
 
 - **🛍 Store** — browse every published jan-tdy app, grouped by category, with
   icon, version and one-click **Install** (a `git clone` under the hood).
-- **📲 Installed** — launch or remove what you installed, and install an app's
-  Python dependencies (`pip install -r …`) when it declares a requirements file.
+  Scanning every jan-tdy repo can take up to a minute on the first run, so the
+  catalog is **cached to disk** and shown instantly on the next launch while a
+  fresh scan runs in the background.
+- **📲 Installed** — **launch**, **update** or **remove** apps, **add them to
+  your application menu** (creates a `.desktop` launcher with the app's icon),
+  and install an app's Python dependencies (`pip install -r …`) when it
+  declares a requirements file.
 - **⟳ Updates** — installed apps whose published version is newer than the one
-  you have are listed here; update them individually or all at once.
+  you have are listed here; update them individually or all at once. Code
+  Master both **installs and updates** apps (`sync` apps via `git pull`,
+  `release` apps by fetching the latest release tag).
 - **⚙ Manual & Settings** — register jan-tdy apps you installed **by hand** by
   pointing Code Master at a folder containing a `codemaster-metadata.json`
-  file. Also configure the GitHub user, metadata branch and an optional token.
+  file. Configure the GitHub user, metadata branch and an optional token, and
+  **update Code Master itself** in place (when run from a git checkout).
 - **▶ Code Runner** — the small Python editor/runner from the classic Code
-  Master, kept for quick snippets.
+  Master, kept for quick snippets (runs asynchronously so it never freezes the
+  UI).
 
 ---
 
@@ -56,6 +65,9 @@ Code Master keeps its state in:
 | `~/.config/codemaster/config.json`    | GitHub user, branch, token, manual folders |
 | `~/.config/codemaster/installed.json` | registry of installed apps |
 | `~/.local/share/codemaster/apps/`     | cloned repositories of installed apps |
+| `~/.local/share/codemaster/cache/`    | cached catalog + icons (instant startup) |
+| `~/.local/share/codemaster/launcher-icons/` | icons for generated `.desktop` launchers |
+| `~/.local/share/applications/codemaster-*.desktop` | menu launchers Code Master creates for apps |
 
 ---
 

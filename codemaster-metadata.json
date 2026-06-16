@@ -10,7 +10,7 @@
       "tagline": "App store & code runner for jan-tdy apps",
       "description": "A desktop app store for discovering, installing, updating and launching jan-tdy applications. Also bundles a small code editor/runner and a GitHub downloader.",
       "category": "Developer Tools",
-      "version": "2.0.0",
+      "version": "2.1.0",
       "author": "JapySoft TDY",
       "icon": "assets/codemaster.svg",
       "subdir": ".",

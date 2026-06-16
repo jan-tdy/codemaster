@@ -31,7 +31,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QProcess
 from PyQt5.QtGui import QPixmap, QColor, QPainter, QFont
 
 APP_NAME = "Jadiv Code Master"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 DEFAULT_USERNAME = "jan-tdy"
 DEFAULT_BRANCH = "main"
 METADATA_FILE = "codemaster-metadata.json"
@@ -41,6 +41,29 @@ DATA_DIR = Path.home() / ".local" / "share" / "codemaster"
 APPS_DIR = DATA_DIR / "apps"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 INSTALLED_FILE = CONFIG_DIR / "installed.json"
+
+# Cache of the last scanned catalog, so apps show up instantly on next launch
+# while a fresh scan runs in the background.
+CACHE_DIR = DATA_DIR / "cache"
+CATALOG_CACHE = CACHE_DIR / "catalog.json"
+ICON_CACHE_DIR = CACHE_DIR / "icons"
+
+# Desktop launchers Code Master creates for installed apps.
+APPLICATIONS_DIR = Path(os.environ.get(
+    "XDG_DATA_HOME", Path.home() / ".local" / "share")) / "applications"
+LAUNCHER_ICON_DIR = DATA_DIR / "launcher-icons"
+
+# Maps a metadata category to freedesktop.org Categories= values.
+DESKTOP_CATEGORIES = {
+    "Astronomy": "Science;Education;",
+    "Photography": "Graphics;Photography;",
+    "Education": "Education;",
+    "Developer Tools": "Development;",
+    "Developer": "Development;",
+}
+
+# Directory the running Code Master lives in (used for self-update).
+SELF_DIR = Path(__file__).resolve().parent
 
 ICON_SIZE = 64
 
@@ -90,6 +113,52 @@ def load_installed():
 
 def save_installed(data):
     _write_json(INSTALLED_FILE, data)
+
+
+def _cache_icon_name(key):
+    return key.replace("/", "__").replace(" ", "_")
+
+
+def save_catalog_cache(apps):
+    """Persist the scanned catalog so it can be shown instantly next launch.
+    Icon bytes don't fit in JSON, so each icon is written to its own file and
+    referenced by name."""
+    try:
+        ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        serial = []
+        for app in apps:
+            record = {k: v for k, v in app.items() if k != "icon_data"}
+            icon = app.get("icon_data")
+            if icon:
+                fname = _cache_icon_name(app["key"]) + ".img"
+                (ICON_CACHE_DIR / fname).write_bytes(icon)
+                record["icon_file"] = fname
+            else:
+                record["icon_file"] = None
+            serial.append(record)
+        _write_json(CATALOG_CACHE, {"apps": serial})
+    except Exception:
+        pass  # caching is best-effort; never break a successful scan over it
+
+
+def load_catalog_cache():
+    data = _read_json(CATALOG_CACHE, None)
+    if not data:
+        return []
+    apps = []
+    for record in data.get("apps", []):
+        app = dict(record)
+        icon_file = app.pop("icon_file", None)
+        app["icon_data"] = None
+        if icon_file:
+            path = ICON_CACHE_DIR / icon_file
+            if path.exists():
+                try:
+                    app["icon_data"] = path.read_bytes()
+                except Exception:
+                    pass
+        apps.append(app)
+    return apps
 
 
 # --------------------------------------------------------------------------- #
@@ -403,6 +472,12 @@ class AppCard(QFrame):
                                self.store.has_update(self.app) else "Ghost",
                                self.store.launch_app)
             col.addWidget(launch)
+            if self.store.has_launcher(self.app):
+                col.addWidget(self._btn("Remove launcher", "Ghost",
+                                        self.store.remove_launcher))
+            else:
+                col.addWidget(self._btn("Add to menu", "Ghost",
+                                        self.store.create_launcher))
             if self.app.get("requirements"):
                 col.addWidget(self._btn("Install deps", "Ghost",
                                         self.store.install_deps))
@@ -437,7 +512,9 @@ class CodeMaster(QMainWindow):
 
         self.config = load_config()
         self.installed = load_installed()
-        self.catalog = []
+        # Show the previously-scanned catalog instantly; a fresh scan runs in
+        # the background right after the window is up.
+        self.catalog = load_catalog_cache()
         self._workers = set()
 
         central = QWidget()
@@ -550,8 +627,27 @@ class CodeMaster(QMainWindow):
         save_btn.clicked.connect(self.save_settings)
         lay.addWidget(save_btn, alignment=Qt.AlignLeft)
 
+        line2 = QFrame()
+        line2.setFrameShape(QFrame.HLine)
+        lay.addWidget(line2)
+
+        lay.addWidget(QLabel(f"<b>About Code Master</b> — v{APP_VERSION}"))
+        self_update_row = QHBoxLayout()
+        self.self_update_btn = QPushButton("Update Code Master")
+        self.self_update_btn.setObjectName("Primary")
+        self.self_update_btn.setCursor(Qt.PointingHandCursor)
+        self.self_update_btn.clicked.connect(self.self_update)
+        self_update_row.addWidget(self.self_update_btn)
+        self_update_row.addStretch()
+        lay.addLayout(self_update_row)
+        self.self_update_note = QLabel()
+        self.self_update_note.setObjectName("AppMeta")
+        self.self_update_note.setWordWrap(True)
+        lay.addWidget(self.self_update_note)
+
         lay.addStretch()
         self._refresh_manual_list()
+        self._refresh_self_update_note()
         return page
 
     def _build_runner_tab(self):
@@ -580,7 +676,15 @@ class CodeMaster(QMainWindow):
     def load_catalog(self):
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("⟳ Loading…")
-        self._set_placeholder(self.store_box, "Loading apps from GitHub…")
+        # If we already have a cached catalog on screen, keep it visible and
+        # just refresh in the background; otherwise show the (slow scan) notice.
+        if self.catalog:
+            self._toast("Refreshing app list from GitHub… (can take a minute)")
+        else:
+            self._set_placeholder(
+                self.store_box,
+                "Scanning every jan-tdy repository on GitHub for apps…\n"
+                "This can take up to a minute on the first run.")
         loader = CatalogLoader(self.config["username"], self.config["branch"],
                                self.config["token"])
         loader.loaded.connect(self.on_catalog_loaded)
@@ -593,15 +697,21 @@ class CodeMaster(QMainWindow):
 
     def on_catalog_loaded(self, apps):
         self.catalog = apps
+        save_catalog_cache(apps)
         self.refresh_btn.setEnabled(True)
         self.refresh_btn.setText("⟳ Refresh")
         self.refresh_views()
+        self._toast(f"Found {len(apps)} app(s)")
 
     def on_catalog_failed(self, message):
         self.refresh_btn.setEnabled(True)
         self.refresh_btn.setText("⟳ Refresh")
-        self._set_placeholder(
-            self.store_box, f"Could not load catalog:\n{message}")
+        # Keep the cached catalog on screen if the refresh failed (e.g. offline).
+        if self.catalog:
+            self._toast(f"Refresh failed, showing cached apps: {message}")
+        else:
+            self._set_placeholder(
+                self.store_box, f"Could not load catalog:\n{message}")
 
     # -- view rebuilding -------------------------------------------------- #
     def refresh_views(self):
@@ -610,6 +720,7 @@ class CodeMaster(QMainWindow):
         self.rebuild_updates()
         if hasattr(self, "manual_list"):
             self._refresh_manual_list()
+        self._refresh_self_update_note()
 
     def _clear(self, box):
         while box.count():
@@ -855,12 +966,98 @@ class CodeMaster(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Launch failed", str(exc))
 
+    # -- desktop launchers ------------------------------------------------ #
+    def _launcher_path(self, app):
+        safe = app["key"].replace("/", "-").replace(" ", "_")
+        return APPLICATIONS_DIR / f"codemaster-{safe}.desktop"
+
+    def _launcher_icon_path(self, app):
+        safe = app["key"].replace("/", "__").replace(" ", "_")
+        return LAUNCHER_ICON_DIR / f"{safe}.png"
+
+    def has_launcher(self, app):
+        return self._launcher_path(app).exists()
+
+    @staticmethod
+    def _update_desktop_db():
+        try:
+            subprocess.run(["update-desktop-database", str(APPLICATIONS_DIR)],
+                           capture_output=True)
+        except Exception:
+            pass  # not fatal — the launcher still works without the cache
+
+    def create_launcher(self, app):
+        cwd = self._repo_root(app) / app.get("subdir", ".")
+        run = app.get("run") or (f"python3 {app.get('entrypoint')}"
+                                 if app.get("entrypoint") else "")
+        if not run:
+            QMessageBox.warning(self, "Launcher",
+                                "No run command defined for this app.")
+            return
+        if not cwd.exists():
+            QMessageBox.warning(self, "Launcher",
+                                f"App folder not found:\n{cwd}\n"
+                                "Install the app first.")
+            return
+
+        # Render the app's icon to a stable PNG the .desktop file can point at.
+        LAUNCHER_ICON_DIR.mkdir(parents=True, exist_ok=True)
+        icon_png = self._launcher_icon_path(app)
+        pm = pixmap_from_bytes(app.get("icon_data"), 128) \
+            or placeholder_pixmap(app.get("name", "?"), 128)
+        pm.save(str(icon_png))
+
+        # The Path key sets the working directory, so the command runs in the
+        # app folder without a fragile `sh -c 'cd …'` wrapper.
+        exec_line = run
+        categories = DESKTOP_CATEGORIES.get(app.get("category", ""), "Utility;")
+        # Comment must be a single line per the Desktop Entry Spec.
+        comment = (app.get("tagline")
+                   or app.get("description", "")).replace("\n", " ")
+        content = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Version=1.0\n"
+            f"Name={app.get('name', app['key'])}\n"
+            f"Comment={comment}\n"
+            f"Exec={exec_line}\n"
+            f"Path={cwd}\n"
+            f"Icon={icon_png}\n"
+            "Terminal=false\n"
+            f"Categories={categories}\n"
+            "StartupNotify=true\n"
+            f"X-CodeMaster-Key={app['key']}\n"
+        )
+        try:
+            APPLICATIONS_DIR.mkdir(parents=True, exist_ok=True)
+            path = self._launcher_path(app)
+            path.write_text(content, encoding="utf-8")
+            path.chmod(0o755)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Launcher", f"Could not write launcher:\n{exc}")
+            return
+        self._update_desktop_db()
+        self.refresh_views()
+        self._toast(f"Added '{app['name']}' to your application menu")
+
+    def remove_launcher(self, app):
+        self._launcher_path(app).unlink(missing_ok=True)
+        self._launcher_icon_path(app).unlink(missing_ok=True)
+        self._update_desktop_db()
+        self.refresh_views()
+        self._toast(f"Removed '{app['name']}' from your application menu")
+
     def uninstall_app(self, app):
         confirm = QMessageBox.question(
             self, "Remove app",
             f"Remove {app['name']} from your installed apps?")
         if confirm != QMessageBox.Yes:
             return
+        # Drop any desktop launcher we created for it.
+        if self.has_launcher(app):
+            self._launcher_path(app).unlink(missing_ok=True)
+            self._launcher_icon_path(app).unlink(missing_ok=True)
+            self._update_desktop_db()
         rec = self.installed.pop(app["key"], None)
         save_installed(self.installed)
         # Delete the cloned repo only if no other installed app still uses it
@@ -933,6 +1130,63 @@ class CodeMaster(QMainWindow):
         save_config(self.config)
         self._toast("Settings saved")
         self.load_catalog()
+
+    # -- self update ------------------------------------------------------ #
+    def _self_catalog_version(self):
+        """Latest published version of Code Master itself, from the catalog."""
+        entry = next((a for a in self.catalog if a["repo"] == "codemaster"),
+                     None)
+        return self.effective_version(entry) if entry else ""
+
+    def _refresh_self_update_note(self):
+        if not hasattr(self, "self_update_note"):
+            return
+        is_git = (SELF_DIR / ".git").exists()
+        latest = self._self_catalog_version()
+        if not is_git:
+            self.self_update_note.setText(
+                f"Running from {SELF_DIR} (not a git checkout). Re-clone or "
+                "git pull manually to update.")
+            self.self_update_btn.setEnabled(False)
+            return
+        self.self_update_btn.setEnabled(True)
+        if latest and latest != APP_VERSION:
+            self.self_update_note.setText(
+                f"Update available: v{latest} (you have v{APP_VERSION}). "
+                "Updates Code Master in place via git; restart to apply.")
+        else:
+            self.self_update_note.setText(
+                "Pulls the latest Code Master from git; restart to apply.")
+
+    def self_update(self):
+        if not (SELF_DIR / ".git").exists():
+            QMessageBox.information(
+                self, "Update Code Master",
+                "Code Master isn't running from a git checkout, so it can't "
+                f"update itself automatically.\n\nLocation:\n{SELF_DIR}")
+            return
+        worker = GitWorker("update", self.config["username"], "codemaster",
+                           SELF_DIR, None)
+        self.self_update_btn.setEnabled(False)
+        self.self_update_btn.setText("Updating…")
+
+        def finished(ok, msg):
+            self._workers.discard(worker)
+            self.self_update_btn.setText("Update Code Master")
+            self.self_update_btn.setEnabled(True)
+            if not ok:
+                QMessageBox.warning(self, "Update Code Master",
+                                    f"Update failed:\n{msg}")
+                return
+            QMessageBox.information(
+                self, "Update Code Master",
+                "Code Master was updated. Restart it to apply the changes.")
+            self._refresh_self_update_note()
+
+        worker.done.connect(finished)
+        self._workers.add(worker)
+        worker.start()
+        self._toast("Updating Code Master…")
 
     # -- code runner ------------------------------------------------------ #
     def run_code(self):
