@@ -161,15 +161,16 @@ class CatalogLoader(QThread):
             chunk = resp.json()
             if not chunk:
                 break
-            repos.extend(r["name"] for r in chunk)
+            repos.extend((r["name"], r.get("default_branch", "main"))
+                         for r in chunk)
             if len(chunk) < 100:
                 break
             page += 1
         return repos
 
-    def _fetch_metadata(self, repo):
+    def _fetch_metadata(self, repo, default_branch):
         branches = []
-        for b in (self.branch, "main", "master"):
+        for b in (self.branch, default_branch):
             if b and b not in branches:
                 branches.append(b)
         for branch in branches:
@@ -204,9 +205,9 @@ class CatalogLoader(QThread):
             self.status.emit("Contacting GitHub…")
             apps = []
             repos = self._list_repos()
-            for repo in repos:
+            for repo, default_branch in repos:
                 self.status.emit(f"Scanning {repo}…")
-                meta, branch = self._fetch_metadata(repo)
+                meta, branch = self._fetch_metadata(repo, default_branch)
                 if not meta:
                     continue
                 for app in meta.get("apps", []):
@@ -637,7 +638,16 @@ class CodeMaster(QMainWindow):
         update_all = QPushButton("Update all")
         update_all.setObjectName("Primary")
         update_all.setCursor(Qt.PointingHandCursor)
-        update_all.clicked.connect(lambda: [self.update_app(a) for a in apps])
+        # One git pull per repo — several apps can share a clone, and parallel
+        # pulls in the same directory collide on .git/index.lock.
+        seen_repos = set()
+        unique_apps = []
+        for a in apps:
+            if a["repo"] not in seen_repos:
+                seen_repos.add(a["repo"])
+                unique_apps.append(a)
+        update_all.clicked.connect(
+            lambda: [self.update_app(a) for a in unique_apps])
         wrap = QWidget()
         wrap.setLayout(header)
         header.addStretch()
@@ -723,11 +733,15 @@ class CodeMaster(QMainWindow):
             if not ok:
                 QMessageBox.warning(self, "Update failed", msg)
                 return
-            catalog = next((a for a in self.catalog
-                            if a["key"] == app["key"]), None)
-            if catalog:
-                self.installed[app["key"]]["version"] = catalog["version"]
-                save_installed(self.installed)
+            # A pull refreshes the whole clone, so every installed app from
+            # this repo is now up to date — sync all their versions.
+            for key, inst in list(self.installed.items()):
+                if inst.get("repo") == app["repo"]:
+                    cat = next((a for a in self.catalog
+                                if a["key"] == key), None)
+                    if cat:
+                        inst["version"] = cat["version"]
+            save_installed(self.installed)
             self.refresh_views()
             self._toast(f"Updated {app['name']}")
 
@@ -864,8 +878,10 @@ class CodeMaster(QMainWindow):
             with open(temp_file, "w", encoding="utf-8") as fh:
                 fh.write(code)
             proc = subprocess.run([sys.executable, temp_file],
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True, timeout=15)
             self.code_output.setText(proc.stdout + proc.stderr)
+        except subprocess.TimeoutExpired:
+            self.code_output.setText("Execution timed out after 15 seconds.")
         except Exception as exc:  # noqa: BLE001
             self.code_output.setText(str(exc))
 
