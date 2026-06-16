@@ -867,21 +867,21 @@ class CodeMaster(QMainWindow):
         ``source``/``repo_root``; without this, acting on a manually-added app
         from the Store would wrongly target ``apps/<repo>`` instead of the
         folder it was installed from."""
+        if not app:
+            return app
         rec = self.installed.get(app.get("key"))
         if not rec:
             return app
-        merged = dict(app)
-        for k, v in rec.items():
-            if v is not None:
-                merged[k] = v
-        return merged
+        return {**app, **{k: v for k, v in rec.items() if v is not None}}
 
     def _repo_root(self, app):
         # Trust the installed record (looked up by key), not the passed dict.
+        if not app:
+            return APPS_DIR
         rec = self.installed.get(app.get("key"))
         if rec and rec.get("repo_root"):
             return Path(rec["repo_root"])
-        return APPS_DIR / app["repo"]
+        return APPS_DIR / app.get("repo", "")
 
     def install_app(self, app):
         repo_root = APPS_DIR / app["repo"]
