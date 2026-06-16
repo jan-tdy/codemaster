@@ -31,7 +31,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QProcess
 from PyQt5.QtGui import QPixmap, QColor, QPainter, QFont
 
 APP_NAME = "Jadiv Code Master"
-APP_VERSION = "2.1.0"
+APP_VERSION = "0.2.2"
 DEFAULT_USERNAME = "jan-tdy"
 DEFAULT_BRANCH = "main"
 METADATA_FILE = "codemaster-metadata.json"
@@ -860,10 +860,28 @@ class CodeMaster(QMainWindow):
         return latest != str(rec.get("version", ""))
 
     # -- install / update / launch --------------------------------------- #
+    def _resolve(self, app):
+        """Overlay the stored installed record onto an app dict.
+
+        Cards in the Store tab carry the raw catalog dict, which has no
+        ``source``/``repo_root``; without this, acting on a manually-added app
+        from the Store would wrongly target ``apps/<repo>`` instead of the
+        folder it was installed from."""
+        if not app:
+            return app
+        rec = self.installed.get(app.get("key"))
+        if not rec:
+            return app
+        return {**app, **{k: v for k, v in rec.items() if v is not None}}
+
     def _repo_root(self, app):
-        if app.get("source") == "manual" and app.get("repo_root"):
-            return Path(app["repo_root"])
-        return APPS_DIR / app["repo"]
+        # Trust the installed record (looked up by key), not the passed dict.
+        if not app:
+            return APPS_DIR
+        rec = self.installed.get(app.get("key"))
+        if rec and rec.get("repo_root"):
+            return Path(rec["repo_root"])
+        return APPS_DIR / app.get("repo", "")
 
     def install_app(self, app):
         repo_root = APPS_DIR / app["repo"]
@@ -896,6 +914,7 @@ class CodeMaster(QMainWindow):
         self._toast(f"Installing {app['name']}…")
 
     def update_app(self, app):
+        app = self._resolve(app)
         repo_root = self._repo_root(app)
         catalog = next((a for a in self.catalog if a["key"] == app["key"]),
                        None) or app
@@ -927,6 +946,7 @@ class CodeMaster(QMainWindow):
         self._toast(f"Updating {app['name']}…")
 
     def install_deps(self, app):
+        app = self._resolve(app)
         repo_root = self._repo_root(app)
         req = repo_root / app.get("subdir", ".") / app["requirements"]
         if not req.exists():
@@ -948,6 +968,7 @@ class CodeMaster(QMainWindow):
         self._toast(f"Installing dependencies for {app['name']}…")
 
     def launch_app(self, app):
+        app = self._resolve(app)
         repo_root = self._repo_root(app)
         cwd = repo_root / app.get("subdir", ".")
         run = app.get("run") or (f"python3 {app.get('entrypoint')}"
@@ -987,6 +1008,7 @@ class CodeMaster(QMainWindow):
             pass  # not fatal — the launcher still works without the cache
 
     def create_launcher(self, app):
+        app = self._resolve(app)
         cwd = self._repo_root(app) / app.get("subdir", ".")
         run = app.get("run") or (f"python3 {app.get('entrypoint')}"
                                  if app.get("entrypoint") else "")
