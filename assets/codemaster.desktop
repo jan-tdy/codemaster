@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Jadiv Code Master
+Comment=App store for jan-tdy applications
+Comment[sk]=Obchod s aplikáciami pre jan-tdy
+Exec=python3 "__INSTALL_DIR__/jadiv_code_master.py"
+Path=__INSTALL_DIR__
+Icon=codemaster
+Terminal=false
+Categories=Development;Utility;System;
+Keywords=appstore;apps;store;jan-tdy;install;update;code;
+StartupNotify=true
