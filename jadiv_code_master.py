@@ -230,16 +230,38 @@ class CatalogLoader(QThread):
     def _headers(self):
         return {"Authorization": f"token {self.token}"} if self.token else {}
 
+    def _authenticated_login(self):
+        """Login the configured token belongs to, or None if it can't be
+        determined (no token, request failure, ...)."""
+        try:
+            resp = requests.get("https://api.github.com/user",
+                                headers=self._headers(), timeout=20)
+            resp.raise_for_status()
+            return resp.json().get("login", "")
+        except requests.RequestException:
+            return None
+
     def _list_repos(self):
         """List every repo owned by ``self.username``.
 
         ``/users/{username}/repos`` only ever returns public repositories,
-        no matter who is authenticated. To also see private repos we have
-        to use ``/user/repos`` (the authenticated user's own repos,
-        public *and* private) and keep only the ones owned by the
-        configured username, which requires a token."""
+        no matter who is authenticated. To also see private repos we need
+        ``/user/repos`` (the *authenticated* user's own repos, public and
+        private) — but that only lists ``self.username``'s repos if the
+        configured token actually belongs to that account. A token for a
+        different account (e.g. someone's own PAT, added just to raise the
+        rate limit while browsing jan-tdy's public repos) would otherwise
+        make every repo fail the owner filter below and return an empty
+        catalog. Verify the token owner first; fall back to the public
+        listing (still with the token in headers, for the rate-limit
+        benefit) when it doesn't match."""
         repos, page = [], 1
+        use_user_repos = False
         if self.token:
+            auth_login = self._authenticated_login()
+            use_user_repos = bool(auth_login) and \
+                auth_login.lower() == self.username.lower()
+        if use_user_repos:
             url_base = "https://api.github.com/user/repos"
             extra = "&affiliation=owner&visibility=all"
         else:
@@ -254,7 +276,7 @@ class CatalogLoader(QThread):
                 break
             for r in chunk:
                 owner = (r.get("owner") or {}).get("login", "")
-                if self.token and owner.lower() != self.username.lower():
+                if use_user_repos and owner.lower() != self.username.lower():
                     continue
                 repos.append((r["name"], r.get("default_branch", "main"),
                              bool(r.get("private"))))
