@@ -31,6 +31,12 @@ publishes the Telescope Cover, Astrofoto, Atacama (C14) and DSLR apps.
   pointing Code Master at a folder containing a `codemaster-metadata.json`
   file. Configure the GitHub user, metadata branch and an optional token, and
   **update Code Master itself** in place (when run from a git checkout).
+- **🔒 Private repos** — add a GitHub token with `repo` scope in Settings and
+  Code Master will scan, list, install and update your **private** jan-tdy
+  repositories too, not just public ones. Private apps show a 🔒 badge in the
+  Store. The token authenticates the catalog scan, the metadata/icon fetch
+  and the `git clone`/`git pull` used to install and update — it's passed
+  per-command and never written into a cloned repo's `.git/config`.
 - **▶ Code Runner** — the small Python editor/runner from the classic Code
   Master, kept for quick snippets (runs asynchronously so it never freezes the
   UI).
