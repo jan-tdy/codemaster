@@ -19,6 +19,7 @@ import json
 import shutil
 import subprocess
 import hashlib
+import base64
 from pathlib import Path
 
 import requests
@@ -31,7 +32,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QProcess
 from PyQt5.QtGui import QPixmap, QColor, QPainter, QFont
 
 APP_NAME = "Jadiv Code Master"
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.2.3"
 DEFAULT_USERNAME = "jan-tdy"
 DEFAULT_BRANCH = "main"
 METADATA_FILE = "codemaster-metadata.json"
@@ -230,17 +231,33 @@ class CatalogLoader(QThread):
         return {"Authorization": f"token {self.token}"} if self.token else {}
 
     def _list_repos(self):
+        """List every repo owned by ``self.username``.
+
+        ``/users/{username}/repos`` only ever returns public repositories,
+        no matter who is authenticated. To also see private repos we have
+        to use ``/user/repos`` (the authenticated user's own repos,
+        public *and* private) and keep only the ones owned by the
+        configured username, which requires a token."""
         repos, page = [], 1
+        if self.token:
+            url_base = "https://api.github.com/user/repos"
+            extra = "&affiliation=owner&visibility=all"
+        else:
+            url_base = f"https://api.github.com/users/{self.username}/repos"
+            extra = ""
         while True:
-            url = (f"https://api.github.com/users/{self.username}/repos"
-                   f"?per_page=100&page={page}")
+            url = f"{url_base}?per_page=100&page={page}{extra}"
             resp = requests.get(url, headers=self._headers(), timeout=20)
             resp.raise_for_status()
             chunk = resp.json()
             if not chunk:
                 break
-            repos.extend((r["name"], r.get("default_branch", "main"))
-                         for r in chunk)
+            for r in chunk:
+                owner = (r.get("owner") or {}).get("login", "")
+                if self.token and owner.lower() != self.username.lower():
+                    continue
+                repos.append((r["name"], r.get("default_branch", "main"),
+                             bool(r.get("private"))))
             if len(chunk) < 100:
                 break
             page += 1
@@ -295,7 +312,7 @@ class CatalogLoader(QThread):
             self.status.emit("Contacting GitHub…")
             apps = []
             repos = self._list_repos()
-            for repo, default_branch in repos:
+            for repo, default_branch, is_private in repos:
                 self.status.emit(f"Scanning {repo}…")
                 meta, branch = self._fetch_metadata(repo, default_branch)
                 if not meta:
@@ -329,6 +346,7 @@ class CatalogLoader(QThread):
                                        else None,
                         "homepage": app.get("homepage")
                                     or meta.get("homepage"),
+                        "private": is_private,
                     })
             apps.sort(key=lambda a: (a["category"].lower(), a["name"].lower()))
             self.loaded.emit(apps)
@@ -341,7 +359,7 @@ class GitWorker(QThread):
     done = pyqtSignal(bool, str)
 
     def __init__(self, action, username, repo, repo_root, branch,
-                 req_path=None, method="sync", release_tag=None):
+                 req_path=None, method="sync", release_tag=None, token=""):
         super().__init__()
         self.action = action
         self.username = username
@@ -351,6 +369,7 @@ class GitWorker(QThread):
         self.req_path = req_path
         self.method = method
         self.release_tag = release_tag
+        self.token = token
 
     def _run(self, cmd, cwd=None):
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
@@ -358,13 +377,25 @@ class GitWorker(QThread):
             raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
         return proc.stdout
 
+    def _auth_args(self):
+        """Per-invocation git auth for private repos.
+
+        Passed via ``-c http.extraheader`` rather than embedding the token
+        in the remote URL, so it is never written into the clone's
+        ``.git/config`` on disk."""
+        if not self.token:
+            return []
+        basic = base64.b64encode(
+            f"x-access-token:{self.token}".encode("utf-8")).decode("ascii")
+        return ["-c", f"http.extraheader=Authorization: Basic {basic}"]
+
     def _clone(self, ref):
         """Fresh shallow clone of the repo at a branch or tag."""
         url = f"https://github.com/{self.username}/{self.repo}.git"
         if self.repo_root.exists():
             shutil.rmtree(self.repo_root)
         self.repo_root.parent.mkdir(parents=True, exist_ok=True)
-        cmd = ["git", "clone", "--depth", "1"]
+        cmd = ["git"] + self._auth_args() + ["clone", "--depth", "1"]
         if ref:
             cmd += ["--branch", ref]
         cmd += [url, str(self.repo_root)]
@@ -383,7 +414,8 @@ class GitWorker(QThread):
                         not (self.repo_root / ".git").exists():
                     self._clone(self.branch)
                 else:
-                    self._run(["git", "-C", str(self.repo_root), "pull",
+                    self._run(["git"] + self._auth_args() +
+                              ["-C", str(self.repo_root), "pull",
                                "--ff-only"])
                 self.done.emit(
                     True, "Installed" if self.action == "install"
@@ -441,6 +473,8 @@ class AppCard(QFrame):
         if version:
             meta_bits.append("v" + version)
         meta_bits.append(self.app["repo"])
+        if self.app.get("private"):
+            meta_bits.append("🔒 private")
         if self.app.get("update_method") == "release":
             meta_bits.append("↻ release")
         else:
@@ -615,7 +649,9 @@ class CodeMaster(QMainWindow):
         self.branch_in = QLineEdit(self.config["branch"])
         self.token_in = QLineEdit(self.config["token"])
         self.token_in.setEchoMode(QLineEdit.Password)
-        self.token_in.setPlaceholderText("optional – raises GitHub rate limit")
+        self.token_in.setPlaceholderText(
+            "optional – required to see/update private repos, also raises "
+            "GitHub rate limit")
         form.addRow("GitHub user:", self.username_in)
         form.addRow("Metadata branch:", self.branch_in)
         form.addRow("GitHub token:", self.token_in)
@@ -888,7 +924,8 @@ class CodeMaster(QMainWindow):
         worker = GitWorker("install", self.config["username"], app["repo"],
                            repo_root, app.get("branch", self.config["branch"]),
                            method=app.get("update_method", "sync"),
-                           release_tag=app.get("release_tag"))
+                           release_tag=app.get("release_tag"),
+                           token=self.config["token"])
 
         def finished(ok, msg):
             self._workers.discard(worker)
@@ -921,7 +958,8 @@ class CodeMaster(QMainWindow):
         worker = GitWorker("update", self.config["username"], app["repo"],
                            repo_root, app.get("branch", self.config["branch"]),
                            method=catalog.get("update_method", "sync"),
-                           release_tag=catalog.get("release_tag"))
+                           release_tag=catalog.get("release_tag"),
+                           token=self.config["token"])
 
         def finished(ok, msg):
             self._workers.discard(worker)
@@ -1188,7 +1226,7 @@ class CodeMaster(QMainWindow):
                 f"update itself automatically.\n\nLocation:\n{SELF_DIR}")
             return
         worker = GitWorker("update", self.config["username"], "codemaster",
-                           SELF_DIR, None)
+                           SELF_DIR, None, token=self.config["token"])
         self.self_update_btn.setEnabled(False)
         self.self_update_btn.setText("Updating…")
 
