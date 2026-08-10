@@ -46,9 +46,15 @@ publishes the Telescope Cover, Astrofoto, Atacama (C14) and DSLR apps.
 ## Running
 
 ```bash
-pip install PyQt5 requests        # PyQt5.QtSvg is needed for SVG icons
+python3 -m pip install --user PyQt5 requests   # PyQt5.QtSvg is needed for SVG icons
 python3 jadiv_code_master.py
 ```
+
+`python3 -m pip` (rather than a bare `pip`) guarantees the packages land in the
+same interpreter that actually runs the app. On Debian/Ubuntu/Arch and other
+distros with [PEP 668](https://peps.python.org/pep-0668/) "externally managed"
+system Pythons, add `--break-system-packages` if pip refuses with an
+`externally-managed-environment` error.
 
 ### Desktop launcher
 
