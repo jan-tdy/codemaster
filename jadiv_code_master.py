@@ -34,7 +34,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QProcess, QTimer
 from PyQt5.QtGui import QPixmap, QColor, QPainter, QFont
 
 APP_NAME = "Jadiv Code Master"
-APP_VERSION = "0.2.3"
+APP_VERSION = "0.3.0"
 DEFAULT_USERNAME = "jan-tdy"
 DEFAULT_BRANCH = "main"
 METADATA_FILE = "codemaster-metadata.json"
