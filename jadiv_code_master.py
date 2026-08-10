@@ -16,8 +16,10 @@ Features:
 import sys
 import os
 import json
+import shlex
 import shutil
 import subprocess
+import tempfile
 import hashlib
 import base64
 from pathlib import Path
@@ -28,7 +30,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QTextEdit, QLineEdit, QLabel, QScrollArea, QFrame, QGridLayout,
     QSizePolicy, QFileDialog, QMessageBox, QCheckBox, QFormLayout
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QProcess
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QProcess, QTimer
 from PyQt5.QtGui import QPixmap, QColor, QPainter, QFont
 
 APP_NAME = "Jadiv Code Master"
@@ -49,9 +51,17 @@ CACHE_DIR = DATA_DIR / "cache"
 CATALOG_CACHE = CACHE_DIR / "catalog.json"
 ICON_CACHE_DIR = CACHE_DIR / "icons"
 
+def _xdg_data_home():
+    """Read $XDG_DATA_HOME the way install-launcher.sh's shell
+    ``${XDG_DATA_HOME:-default}`` does: an unset *or* empty value falls
+    back to the default, so the app agrees with the installer on where
+    launchers live even on systems that export the variable empty."""
+    value = os.environ.get("XDG_DATA_HOME")
+    return Path(value) if value else Path.home() / ".local" / "share"
+
+
 # Desktop launchers Code Master creates for installed apps.
-APPLICATIONS_DIR = Path(os.environ.get(
-    "XDG_DATA_HOME", Path.home() / ".local" / "share")) / "applications"
+APPLICATIONS_DIR = _xdg_data_home() / "applications"
 LAUNCHER_ICON_DIR = DATA_DIR / "launcher-icons"
 
 # Maps a metadata category to freedesktop.org Categories= values.
@@ -448,6 +458,27 @@ class GitWorker(QThread):
                 self.done.emit(True, "Dependencies installed")
         except Exception as exc:  # noqa: BLE001
             self.done.emit(False, str(exc))
+
+
+# --------------------------------------------------------------------------- #
+#  Desktop entry helpers
+# --------------------------------------------------------------------------- #
+def _desktop_exec_quote(s):
+    """Escape a string for embedding inside a double-quoted Exec= value,
+    per the Desktop Entry Specification's quoting rules."""
+    return (s.replace("\\", "\\\\").replace("`", "\\`")
+             .replace("$", "\\$").replace('"', '\\"'))
+
+
+def _desktop_exec_line(cwd, run):
+    """Build an Exec= value that changes into ``cwd`` itself instead of
+    relying on the .desktop file's Path= key. Not every application menu /
+    launcher (e.g. several dmenu-style launchers used on tiling window
+    managers) honours Path=, which makes a launcher with a relative run
+    command silently fail to open on those setups while working fine on a
+    desktop environment that does honour it."""
+    shell_cmd = f"cd {shlex.quote(cwd)} && {run}"
+    return f'sh -c "{_desktop_exec_quote(shell_cmd)}"'
 
 
 # --------------------------------------------------------------------------- #
@@ -1041,11 +1072,46 @@ class CodeMaster(QMainWindow):
             QMessageBox.warning(self, "Launch",
                                 f"App folder not found:\n{cwd}")
             return
+        # Capture stderr to a temp file (not a pipe — a long-running app that
+        # logs a lot would eventually fill an unread pipe buffer and hang) so
+        # that if the process dies right away (e.g. a missing dependency) we
+        # can show *why* instead of silently reporting "Launched" while
+        # nothing actually opens.
+        log_fd, log_path = tempfile.mkstemp(prefix="codemaster-launch-")
         try:
-            subprocess.Popen(run, shell=True, cwd=str(cwd))
-            self._toast(f"Launched {app['name']}")
+            proc = subprocess.Popen(run, shell=True, cwd=str(cwd),
+                                    stdout=subprocess.DEVNULL, stderr=log_fd)
         except Exception as exc:  # noqa: BLE001
+            os.unlink(log_path)
             QMessageBox.warning(self, "Launch failed", str(exc))
+            return
+        finally:
+            # Popen(stderr=<fd>) duplicates it into the child; our copy must
+            # be closed too, or the file descriptor is never released.
+            os.close(log_fd)
+        self._toast(f"Launched {app['name']}")
+
+        def check_alive():
+            ret = proc.poll()
+            err = ""
+            if ret not in (None, 0):
+                try:
+                    err = Path(log_path).read_text(
+                        encoding="utf-8", errors="replace").strip()
+                except OSError:
+                    pass
+            if ret is not None:
+                try:
+                    os.unlink(log_path)
+                except OSError:
+                    pass
+            if ret not in (None, 0):
+                msg = f"{app['name']} exited immediately (code {ret})."
+                if err:
+                    msg += "\n\n" + err[-2000:]
+                QMessageBox.warning(self, "Launch failed", msg)
+
+        QTimer.singleShot(1500, check_alive)
 
     # -- desktop launchers ------------------------------------------------ #
     def _launcher_path(self, app):
@@ -1081,6 +1147,7 @@ class CodeMaster(QMainWindow):
                                 f"App folder not found:\n{cwd}\n"
                                 "Install the app first.")
             return
+        cwd = os.path.normpath(str(cwd))
 
         # Render the app's icon to a stable PNG the .desktop file can point at.
         LAUNCHER_ICON_DIR.mkdir(parents=True, exist_ok=True)
@@ -1089,9 +1156,10 @@ class CodeMaster(QMainWindow):
             or placeholder_pixmap(app.get("name", "?"), 128)
         pm.save(str(icon_png))
 
-        # The Path key sets the working directory, so the command runs in the
-        # app folder without a fragile `sh -c 'cd …'` wrapper.
-        exec_line = run
+        # Keep the Path key for desktop environments that honour it, but make
+        # Exec self-contained (see _desktop_exec_line) so the launcher also
+        # works on the ones that don't.
+        exec_line = _desktop_exec_line(cwd, run)
         categories = DESKTOP_CATEGORIES.get(app.get("category", ""), "Utility;")
         # Comment must be a single line per the Desktop Entry Spec.
         comment = (app.get("tagline")
