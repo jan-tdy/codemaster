@@ -433,6 +433,27 @@ class GitWorker(QThread):
         cmd += [url, str(self.repo_root)]
         self._run(cmd)
 
+    def _install_deps(self):
+        # Install into the interpreter that will actually run the app —
+        # the same bare `python3` launch_app()/create_launcher() resolve
+        # via PATH — not Code Master's own sys.executable. The two can be
+        # different interpreters (e.g. Code Master running from a pyenv
+        # build while apps launch with the system python3), so a
+        # dependency installed into one is invisible to the other: pip
+        # reports success, but the app still fails to import it when run.
+        python = shutil.which("python3") or sys.executable
+        cmd = [python, "-m", "pip", "install", "-r", str(self.req_path)]
+        try:
+            self._run(cmd)
+        except RuntimeError as exc:
+            if "externally-managed-environment" not in str(exc):
+                raise
+            # PEP 668: the system Python refuses direct installs. Retry as
+            # a --user install with the override flag, matching what pip's
+            # own error message recommends, so deps actually land instead
+            # of failing outright on Debian/Ubuntu/Arch and the like.
+            self._run(cmd + ["--user", "--break-system-packages"])
+
     def run(self):
         try:
             # "release" apps track a tagged GitHub release; "sync" apps track
@@ -453,8 +474,7 @@ class GitWorker(QThread):
                     True, "Installed" if self.action == "install"
                     else "Updated")
             elif self.action == "deps":
-                self._run([sys.executable, "-m", "pip", "install", "-r",
-                           str(self.req_path)])
+                self._install_deps()
                 self.done.emit(True, "Dependencies installed")
         except Exception as exc:  # noqa: BLE001
             self.done.emit(False, str(exc))
