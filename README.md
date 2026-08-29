@@ -8,7 +8,8 @@ publishes. A single repository can publish several apps — for example
 [`devcontrolenterpise`](https://github.com/jan-tdy/devcontrolenterpise)
 publishes the Telescope Cover, Astrofoto, Atacama (C14) and DSLR apps.
 
-![tabs: Store · Installed · Updates · Manual & Settings · Code Runner](https://img.shields.io/badge/tabs-Store%20%C2%B7%20Installed%20%C2%B7%20Updates%20%C2%B7%20Manual%20%C2%B7%20Code%20Runner-4f8cff?style=for-the-badge)
+<img width="668" height="515" alt="image" src="https://github.com/user-attachments/assets/d9ffb44d-734e-4255-8676-1b67f46d4fca" />
+
 
 ---
 
