@@ -1078,7 +1078,12 @@ class CodeMaster(QMainWindow):
                 "name": app["name"], "repo": app["repo"],
                 "category": app["category"],
                 "version": self.effective_version(app),
-                "commit": commit or app.get("latest_commit"),
+                # Only ever the commit GitWorker actually checked out — never
+                # the pre-fetch catalog SHA. If HEAD resolution failed
+                # (rev-parse error after an otherwise successful clone/pull),
+                # this comes back empty, and the app is simply flagged as
+                # updatable again next time rather than trusting a guess.
+                "commit": commit,
                 "subdir": app.get("subdir", "."), "run": app.get("run", ""),
                 "requirements": app.get("requirements"),
                 "update_method": app.get("update_method", "sync"),
@@ -1117,7 +1122,9 @@ class CodeMaster(QMainWindow):
                                 if a["key"] == key), None)
                     if cat:
                         inst["version"] = self.effective_version(cat)
-                        inst["commit"] = commit or cat.get("latest_commit")
+                        # Same rule as install_app: never substitute the
+                        # catalog's pre-fetch SHA for a failed HEAD resolve.
+                        inst["commit"] = commit
             save_installed(self.installed)
             self.refresh_views()
             self._toast(f"Updated {app['name']}")
@@ -1498,9 +1505,18 @@ class CodeMaster(QMainWindow):
             lambda: self.code_output.insertPlainText(
                 bytes(proc.readAll()).decode("utf-8", errors="replace")))
         proc.finished.connect(lambda *_: self._on_code_finished())
-        proc.errorOccurred.connect(
-            lambda *_: self.code_output.insertPlainText(
-                f"\n[process error: {proc.errorString()}]"))
+
+        def on_error():
+            self.code_output.insertPlainText(
+                f"\n[process error: {proc.errorString()}]")
+            # QProcess::FailedToStart never emits finished, so without this
+            # the temp file and "Stop" button state would be stuck forever.
+            # _on_code_finished() is idempotent, so calling it again for
+            # errors that *do* still emit finished (e.g. Crashed) is safe.
+            if proc.error() == QProcess.FailedToStart:
+                self._on_code_finished()
+
+        proc.errorOccurred.connect(on_error)
         self._runner_process = proc
         self._runner_temp_file = temp_file
         proc.start(sys.executable, [temp_file])
