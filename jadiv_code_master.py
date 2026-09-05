@@ -111,11 +111,19 @@ def load_config():
     cfg.setdefault("branch", DEFAULT_BRANCH)
     cfg.setdefault("token", "")
     cfg.setdefault("manual_paths", [])
+    cfg.setdefault("confirmed_commands", {})
     return cfg
 
 
 def save_config(cfg):
     _write_json(CONFIG_FILE, cfg)
+    # The token (when set) grants repo-scoped GitHub access, so keep the
+    # config file and its directory readable only by the owner.
+    try:
+        CONFIG_DIR.chmod(0o700)
+        CONFIG_FILE.chmod(0o600)
+    except OSError:
+        pass
 
 
 def load_installed():
@@ -326,6 +334,20 @@ class CatalogLoader(QThread):
             return None
         return None
 
+    def _fetch_latest_commit(self, repo, branch):
+        """Latest commit SHA on ``branch``, used to detect updates for
+        'sync' apps whose publisher may forget to bump the metadata
+        version."""
+        url = (f"https://api.github.com/repos/{self.username}/"
+               f"{repo}/commits/{branch}")
+        try:
+            resp = requests.get(url, headers=self._headers(), timeout=20)
+            if resp.status_code == 200:
+                return resp.json().get("sha")
+        except requests.RequestException:
+            return None
+        return None
+
     def _fetch_icon(self, repo, branch, icon_path):
         if not icon_path:
             return None
@@ -353,6 +375,10 @@ class CatalogLoader(QThread):
                 if any(a.get("update_method") == "release"
                        for a in meta.get("apps", [])):
                     release_tag = self._fetch_release(repo)
+                sync_commit = None
+                if any(a.get("update_method", "sync") != "release"
+                       for a in meta.get("apps", [])):
+                    sync_commit = self._fetch_latest_commit(repo, branch)
                 for app in meta.get("apps", []):
                     icon_data = self._fetch_icon(repo, branch, app.get("icon"))
                     method = app.get("update_method", "sync")
@@ -376,6 +402,8 @@ class CatalogLoader(QThread):
                         "update_method": method,
                         "release_tag": release_tag if method == "release"
                                        else None,
+                        "latest_commit": sync_commit if method != "release"
+                                         else None,
                         "homepage": app.get("homepage")
                                     or meta.get("homepage"),
                         "private": is_private,
@@ -774,6 +802,7 @@ class CodeMaster(QMainWindow):
         self.run_btn.clicked.connect(self.run_code)
         lay.addWidget(self.run_btn, alignment=Qt.AlignLeft)
         self._runner_process = None
+        self._runner_temp_file = None
 
         lay.addWidget(QLabel("Output:"))
         self.code_output = QTextEdit()
@@ -963,6 +992,14 @@ class CodeMaster(QMainWindow):
                        None)
         if not catalog:
             return False
+        if catalog.get("update_method", "sync") != "release":
+            # "sync" apps track the latest commit on a branch, not a version
+            # string a publisher might forget to bump — compare commit SHAs
+            # so an update is still offered when only the code moved.
+            latest_commit = catalog.get("latest_commit")
+            if not latest_commit:
+                return False
+            return latest_commit != rec.get("commit")
         latest = self.effective_version(catalog)
         if not latest:
             return False
@@ -1009,6 +1046,7 @@ class CodeMaster(QMainWindow):
                 "name": app["name"], "repo": app["repo"],
                 "category": app["category"],
                 "version": self.effective_version(app),
+                "commit": app.get("latest_commit"),
                 "subdir": app.get("subdir", "."), "run": app.get("run", ""),
                 "requirements": app.get("requirements"),
                 "update_method": app.get("update_method", "sync"),
@@ -1047,6 +1085,7 @@ class CodeMaster(QMainWindow):
                                 if a["key"] == key), None)
                     if cat:
                         inst["version"] = self.effective_version(cat)
+                        inst["commit"] = cat.get("latest_commit")
             save_installed(self.installed)
             self.refresh_views()
             self._toast(f"Updated {app['name']}")
@@ -1078,6 +1117,28 @@ class CodeMaster(QMainWindow):
         worker.start()
         self._toast(f"Installing dependencies for {app['name']}…")
 
+    def _confirm_run(self, app, run):
+        """Ask the user to confirm a publisher-supplied run command before
+        it is ever executed or baked into a launcher. The command comes
+        verbatim from ``codemaster-metadata.json`` in the app's repo, so
+        anyone who can push there controls what this runs. Re-asking is
+        skipped once the exact command has already been confirmed for this
+        app; a changed command (e.g. after an update) prompts again."""
+        confirmed = self.config.setdefault("confirmed_commands", {})
+        if confirmed.get(app["key"]) == run:
+            return True
+        resp = QMessageBox.question(
+            self, "Confirm command",
+            f"{app.get('name', app['key'])} will run this command on your "
+            f"machine:\n\n{run}\n\n"
+            "This comes from the app's publisher metadata. Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if resp != QMessageBox.Yes:
+            return False
+        confirmed[app["key"]] = run
+        save_config(self.config)
+        return True
+
     def launch_app(self, app):
         app = self._resolve(app)
         repo_root = self._repo_root(app)
@@ -1092,6 +1153,14 @@ class CodeMaster(QMainWindow):
             QMessageBox.warning(self, "Launch",
                                 f"App folder not found:\n{cwd}")
             return
+        if not self._confirm_run(app, run):
+            return
+        try:
+            argv = shlex.split(run)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Launch failed",
+                                f"Could not parse run command:\n{exc}")
+            return
         # Capture stderr to a temp file (not a pipe — a long-running app that
         # logs a lot would eventually fill an unread pipe buffer and hang) so
         # that if the process dies right away (e.g. a missing dependency) we
@@ -1099,7 +1168,10 @@ class CodeMaster(QMainWindow):
         # nothing actually opens.
         log_fd, log_path = tempfile.mkstemp(prefix="codemaster-launch-")
         try:
-            proc = subprocess.Popen(run, shell=True, cwd=str(cwd),
+            # No shell=True: argv is executed directly, so shell
+            # metacharacters in a publisher-supplied run command can't be
+            # used to inject extra commands.
+            proc = subprocess.Popen(argv, cwd=str(cwd),
                                     stdout=subprocess.DEVNULL, stderr=log_fd)
         except Exception as exc:  # noqa: BLE001
             os.unlink(log_path)
@@ -1166,6 +1238,8 @@ class CodeMaster(QMainWindow):
             QMessageBox.warning(self, "Launcher",
                                 f"App folder not found:\n{cwd}\n"
                                 "Install the app first.")
+            return
+        if not self._confirm_run(app, run):
             return
         cwd = os.path.normpath(str(cwd))
 
@@ -1367,10 +1441,14 @@ class CodeMaster(QMainWindow):
             return
 
         code = self.code_editor.toPlainText()
-        temp_file = os.path.join(DATA_DIR, "temp_code.py")
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         try:
-            with open(temp_file, "w", encoding="utf-8") as fh:
+            # A unique file per run — reusing one fixed path would let a
+            # still-running previous execution (or a second Code Master
+            # instance) read a file that's being overwritten mid-run.
+            fd, temp_file = tempfile.mkstemp(
+                prefix="codemaster-run-", suffix=".py", dir=str(DATA_DIR))
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(code)
         except Exception as exc:  # noqa: BLE001
             self.code_output.setText(str(exc))
@@ -1390,11 +1468,18 @@ class CodeMaster(QMainWindow):
             lambda *_: self.code_output.insertPlainText(
                 f"\n[process error: {proc.errorString()}]"))
         self._runner_process = proc
+        self._runner_temp_file = temp_file
         proc.start(sys.executable, [temp_file])
 
     def _on_code_finished(self):
         self.run_btn.setText("Run code")
         self._runner_process = None
+        if self._runner_temp_file:
+            try:
+                os.unlink(self._runner_temp_file)
+            except OSError:
+                pass
+            self._runner_temp_file = None
         self._toast("Execution finished")
 
     # -- misc ------------------------------------------------------------- #

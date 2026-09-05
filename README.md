@@ -47,7 +47,7 @@ publishes the Telescope Cover, Astrofoto, Atacama (C14) and DSLR apps.
 ## Running
 
 ```bash
-python3 -m pip install --user PyQt5 requests   # PyQt5.QtSvg is needed for SVG icons
+python3 -m pip install --user -r requirements.txt   # PyQt5.QtSvg is needed for SVG icons
 python3 jadiv_code_master.py
 ```
 
@@ -144,7 +144,7 @@ Each app declares how Code Master should keep it up to date:
 
 | Value | Meaning |
 |-------|---------|
-| `sync` *(default)* | **Replace it with the latest code.** Code Master tracks the metadata branch and `git pull`s the newest commits. The displayed version is the metadata `version`, and an update is offered when that string changes. |
+| `sync` *(default)* | **Replace it with the latest code.** Code Master tracks the metadata branch and `git pull`s the newest commits. The displayed version is the metadata `version`, but an update is offered whenever the branch's latest commit differs from the one you have installed — so it keeps tracking "latest code" even if a publisher pushes without bumping `version`. |
 | `release` | **Download the latest release.** Code Master reads the repo's latest GitHub *release* (`releases/latest`), installs the code at that tag, and offers an update when a newer release tag is published. The displayed version is the release tag. |
 
 Use `release` for apps that cut tagged releases (e.g. JadivCalc, which already
