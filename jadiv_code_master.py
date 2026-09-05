@@ -92,24 +92,24 @@ def _read_json(path, default):
 
 def _write_json(path, data, mode=None):
     # Write to a sibling temp file and atomically replace, so a crash mid-write
-    # can never leave a half-written (corrupt) config behind.
+    # can never leave a half-written (corrupt) config behind. The temp name
+    # is unique per call (mkstemp), not a fixed "<name>.tmp" — two processes
+    # (or two saves racing within one) saving the same path concurrently
+    # would otherwise share one temp file and could corrupt each other's
+    # write before either gets to the atomic replace.
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(".tmp")
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    temp_path = Path(temp_name)
     try:
         if mode is not None:
-            # Create the temp file with the exact mode from the moment it
-            # exists (fchmod on the open fd, before any content is written
-            # and overriding umask) rather than writing first and chmod-ing
+            # Fix the mode on the fd before any content is written,
+            # overriding umask, rather than writing first and chmod-ing
             # afterwards, which left it at default permissions for the
             # whole write. A failure here is not swallowed — the caller
             # decides whether an unsecured write is acceptable.
-            fd = os.open(str(temp_path),
-                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
             os.fchmod(fd, mode)
-            fh = os.fdopen(fd, "w", encoding="utf-8")
-        else:
-            fh = open(temp_path, "w", encoding="utf-8")
-        with fh:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
         temp_path.replace(path)
     except Exception:
