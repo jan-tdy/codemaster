@@ -51,7 +51,8 @@ do_install() {
         # --user --break-system-packages combination is what pip's own
         # error message recommends as the override.
         echo "Warning: PyQt5 or requests is not installed. Install them with:" >&2
-        echo "    python3 -m pip install --user -r requirements.txt" >&2
+        printf '    python3 -m pip install --user -r %q\n' \
+            "$REPO_DIR/requirements.txt" >&2
         echo "    (add --break-system-packages if pip refuses with" >&2
         echo "     'externally-managed-environment')" >&2
     fi

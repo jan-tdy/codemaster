@@ -90,7 +90,7 @@ def _read_json(path, default):
         return default
 
 
-def _write_json(path, data):
+def _write_json(path, data, mode=None):
     # Write to a sibling temp file and atomically replace, so a crash mid-write
     # can never leave a half-written (corrupt) config behind.
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,6 +98,15 @@ def _write_json(path, data):
     try:
         with open(temp_path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
+        if mode is not None:
+            # Set the mode on the temp file itself (os.replace preserves it)
+            # rather than on the final path afterwards, so a sensitive file
+            # is never briefly world-readable between the rename and a
+            # follow-up chmod.
+            try:
+                temp_path.chmod(mode)
+            except OSError:
+                pass
         temp_path.replace(path)
     except Exception:
         if temp_path.exists():
@@ -106,6 +115,16 @@ def _write_json(path, data):
 
 
 def load_config():
+    # Tighten permissions on every load too, not just after a save, so an
+    # install that predates this permission fix gets locked down as soon as
+    # Code Master next runs rather than only after its first settings save.
+    try:
+        if CONFIG_DIR.exists():
+            CONFIG_DIR.chmod(0o700)
+        if CONFIG_FILE.exists():
+            CONFIG_FILE.chmod(0o600)
+    except OSError:
+        pass
     cfg = _read_json(CONFIG_FILE, {})
     cfg.setdefault("username", DEFAULT_USERNAME)
     cfg.setdefault("branch", DEFAULT_BRANCH)
@@ -116,14 +135,14 @@ def load_config():
 
 
 def save_config(cfg):
-    _write_json(CONFIG_FILE, cfg)
     # The token (when set) grants repo-scoped GitHub access, so keep the
     # config file and its directory readable only by the owner.
     try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         CONFIG_DIR.chmod(0o700)
-        CONFIG_FILE.chmod(0o600)
     except OSError:
         pass
+    _write_json(CONFIG_FILE, cfg, mode=0o600)
 
 
 def load_installed():
@@ -416,7 +435,7 @@ class CatalogLoader(QThread):
 
 class GitWorker(QThread):
     """Clone / update / install-deps without freezing the UI."""
-    done = pyqtSignal(bool, str)
+    done = pyqtSignal(bool, str, str)  # ok, message, resolved commit SHA
 
     def __init__(self, action, username, repo, repo_root, branch,
                  req_path=None, method="sync", release_tag=None, token=""):
@@ -461,6 +480,15 @@ class GitWorker(QThread):
         cmd += [url, str(self.repo_root)]
         self._run(cmd)
 
+    def _head_commit(self):
+        """The commit actually checked out in repo_root right now."""
+        try:
+            return self._run(
+                ["git", "-C", str(self.repo_root), "rev-parse", "HEAD"]
+            ).strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _install_deps(self):
         # Install into the interpreter that will actually run the app —
         # the same bare `python3` launch_app()/create_launcher() resolve
@@ -498,14 +526,18 @@ class GitWorker(QThread):
                     self._run(["git"] + self._auth_args() +
                               ["-C", str(self.repo_root), "pull",
                                "--ff-only"])
+                # Report the commit Git actually checked out, not the SHA
+                # the catalog scan saw before this ran — the branch may have
+                # advanced (or a release re-clone lands on a different
+                # commit than the last sync did) in between.
                 self.done.emit(
                     True, "Installed" if self.action == "install"
-                    else "Updated")
+                    else "Updated", self._head_commit())
             elif self.action == "deps":
                 self._install_deps()
-                self.done.emit(True, "Dependencies installed")
+                self.done.emit(True, "Dependencies installed", "")
         except Exception as exc:  # noqa: BLE001
-            self.done.emit(False, str(exc))
+            self.done.emit(False, str(exc), "")
 
 
 # --------------------------------------------------------------------------- #
@@ -1037,7 +1069,7 @@ class CodeMaster(QMainWindow):
                            release_tag=app.get("release_tag"),
                            token=self.config["token"])
 
-        def finished(ok, msg):
+        def finished(ok, msg, commit=""):
             self._workers.discard(worker)
             if not ok:
                 QMessageBox.warning(self, "Install failed", msg)
@@ -1046,7 +1078,7 @@ class CodeMaster(QMainWindow):
                 "name": app["name"], "repo": app["repo"],
                 "category": app["category"],
                 "version": self.effective_version(app),
-                "commit": app.get("latest_commit"),
+                "commit": commit or app.get("latest_commit"),
                 "subdir": app.get("subdir", "."), "run": app.get("run", ""),
                 "requirements": app.get("requirements"),
                 "update_method": app.get("update_method", "sync"),
@@ -1072,7 +1104,7 @@ class CodeMaster(QMainWindow):
                            release_tag=catalog.get("release_tag"),
                            token=self.config["token"])
 
-        def finished(ok, msg):
+        def finished(ok, msg, commit=""):
             self._workers.discard(worker)
             if not ok:
                 QMessageBox.warning(self, "Update failed", msg)
@@ -1085,7 +1117,7 @@ class CodeMaster(QMainWindow):
                                 if a["key"] == key), None)
                     if cat:
                         inst["version"] = self.effective_version(cat)
-                        inst["commit"] = cat.get("latest_commit")
+                        inst["commit"] = commit or cat.get("latest_commit")
             save_installed(self.installed)
             self.refresh_views()
             self._toast(f"Updated {app['name']}")
@@ -1192,11 +1224,13 @@ class CodeMaster(QMainWindow):
                         encoding="utf-8", errors="replace").strip()
                 except OSError:
                     pass
-            if ret is not None:
-                try:
-                    os.unlink(log_path)
-                except OSError:
-                    pass
+            # Whether it exited or is still running, this is the only check
+            # we ever do — nothing will read the log again, so unlink it now
+            # rather than leaking one file per launch into the temp dir.
+            try:
+                os.unlink(log_path)
+            except OSError:
+                pass
             if ret not in (None, 0):
                 msg = f"{app['name']} exited immediately (code {ret})."
                 if err:

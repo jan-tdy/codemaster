@@ -129,7 +129,7 @@ file in its **root**. One repo, one metadata file, any number of apps:
 | `apps[].tagline` | no | One-line summary shown on the card. |
 | `apps[].description` | no | Longer description. |
 | `apps[].category` | no | Used to group apps in the store. |
-| `apps[].version` | no | Drives the **Updates** tab (string compare). |
+| `apps[].version` | no | Display metadata shown on the app's card. `sync` apps detect updates by comparing the installed commit against the latest one on the tracked branch, not this string; `release` apps compare the latest release tag instead. |
 | `apps[].icon` | no | Path **inside the repo** to a PNG/SVG icon, or `null`. |
 | `apps[].subdir` | no | Folder within the repo the app lives in (default `.`). |
 | `apps[].entrypoint` | no | Main script, relative to `subdir`. |
