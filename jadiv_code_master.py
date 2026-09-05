@@ -96,17 +96,21 @@ def _write_json(path, data, mode=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_suffix(".tmp")
     try:
-        with open(temp_path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
         if mode is not None:
-            # Set the mode on the temp file itself (os.replace preserves it)
-            # rather than on the final path afterwards, so a sensitive file
-            # is never briefly world-readable between the rename and a
-            # follow-up chmod.
-            try:
-                temp_path.chmod(mode)
-            except OSError:
-                pass
+            # Create the temp file with the exact mode from the moment it
+            # exists (fchmod on the open fd, before any content is written
+            # and overriding umask) rather than writing first and chmod-ing
+            # afterwards, which left it at default permissions for the
+            # whole write. A failure here is not swallowed — the caller
+            # decides whether an unsecured write is acceptable.
+            fd = os.open(str(temp_path),
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+            os.fchmod(fd, mode)
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+        else:
+            fh = open(temp_path, "w", encoding="utf-8")
+        with fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
         temp_path.replace(path)
     except Exception:
         if temp_path.exists():
@@ -136,12 +140,12 @@ def load_config():
 
 def save_config(cfg):
     # The token (when set) grants repo-scoped GitHub access, so keep the
-    # config file and its directory readable only by the owner.
-    try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_DIR.chmod(0o700)
-    except OSError:
-        pass
+    # config file and its directory readable only by the owner. Unlike
+    # load_config()'s best-effort tightening of an existing install, a
+    # failure here is not swallowed: it's the moment the token is actually
+    # written, so callers must know if it couldn't be secured.
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.chmod(0o700)
     _write_json(CONFIG_FILE, cfg, mode=0o600)
 
 
@@ -1125,6 +1129,12 @@ class CodeMaster(QMainWindow):
                         # Same rule as install_app: never substitute the
                         # catalog's pre-fetch SHA for a failed HEAD resolve.
                         inst["commit"] = commit
+                        # Pick up a publisher's changed run command too —
+                        # _resolve() overlays this stored value over the
+                        # catalog's, so a stale one here would silently keep
+                        # launching the old command (and never re-prompt via
+                        # _confirm_run, since that compares against this).
+                        inst["run"] = cat.get("run", "")
             save_installed(self.installed)
             self.refresh_views()
             self._toast(f"Updated {app['name']}")
@@ -1175,7 +1185,13 @@ class CodeMaster(QMainWindow):
         if resp != QMessageBox.Yes:
             return False
         confirmed[app["key"]] = run
-        save_config(self.config)
+        try:
+            save_config(self.config)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Settings",
+                f"Confirmation was not saved, so this will ask again next "
+                f"time:\n{exc}")
         return True
 
     def launch_app(self, app):
@@ -1396,7 +1412,12 @@ class CodeMaster(QMainWindow):
             count += 1
         if folder not in self.config["manual_paths"]:
             self.config["manual_paths"].append(folder)
-            save_config(self.config)
+            try:
+                save_config(self.config)
+            except OSError as exc:
+                QMessageBox.warning(
+                    self, "Settings",
+                    f"Could not save the manual folder list:\n{exc}")
         save_installed(self.installed)
         self.refresh_views()
         self._toast(f"Registered {count} app(s) from {repo}")
@@ -1412,7 +1433,17 @@ class CodeMaster(QMainWindow):
             or DEFAULT_USERNAME
         self.config["branch"] = self.branch_in.text().strip() or DEFAULT_BRANCH
         self.config["token"] = self.token_in.text().strip()
-        save_config(self.config)
+        try:
+            save_config(self.config)
+        except OSError as exc:
+            # This is the one save that writes the GitHub token — refuse to
+            # report success if it couldn't be written with owner-only
+            # permissions, rather than silently leaving it exposed.
+            QMessageBox.warning(
+                self, "Settings",
+                f"Could not save settings securely, so they were not "
+                f"written to disk:\n{exc}")
+            return
         self._toast("Settings saved")
         self.load_catalog()
 
@@ -1483,6 +1514,7 @@ class CodeMaster(QMainWindow):
 
         code = self.code_editor.toPlainText()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temp_file = None
         try:
             # A unique file per run — reusing one fixed path would let a
             # still-running previous execution (or a second Code Master
@@ -1493,6 +1525,11 @@ class CodeMaster(QMainWindow):
                 fh.write(code)
         except Exception as exc:  # noqa: BLE001
             self.code_output.setText(str(exc))
+            if temp_file:
+                try:
+                    os.unlink(temp_file)
+                except OSError:
+                    pass
             return
 
         # Run asynchronously via QProcess so a long-running or infinite loop
