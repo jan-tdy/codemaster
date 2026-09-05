@@ -47,7 +47,7 @@ publishes the Telescope Cover, Astrofoto, Atacama (C14) and DSLR apps.
 ## Running
 
 ```bash
-python3 -m pip install --user PyQt5 requests   # PyQt5.QtSvg is needed for SVG icons
+python3 -m pip install --user -r requirements.txt   # PyQt5.QtSvg is needed for SVG icons
 python3 jadiv_code_master.py
 ```
 
@@ -129,7 +129,7 @@ file in its **root**. One repo, one metadata file, any number of apps:
 | `apps[].tagline` | no | One-line summary shown on the card. |
 | `apps[].description` | no | Longer description. |
 | `apps[].category` | no | Used to group apps in the store. |
-| `apps[].version` | no | Drives the **Updates** tab (string compare). |
+| `apps[].version` | no | Display metadata shown on the app's card. `sync` apps detect updates by comparing the installed commit against the latest one on the tracked branch, not this string; `release` apps compare the latest release tag instead. |
 | `apps[].icon` | no | Path **inside the repo** to a PNG/SVG icon, or `null`. |
 | `apps[].subdir` | no | Folder within the repo the app lives in (default `.`). |
 | `apps[].entrypoint` | no | Main script, relative to `subdir`. |
@@ -144,7 +144,7 @@ Each app declares how Code Master should keep it up to date:
 
 | Value | Meaning |
 |-------|---------|
-| `sync` *(default)* | **Replace it with the latest code.** Code Master tracks the metadata branch and `git pull`s the newest commits. The displayed version is the metadata `version`, and an update is offered when that string changes. |
+| `sync` *(default)* | **Replace it with the latest code.** Code Master tracks the metadata branch and `git pull`s the newest commits. The displayed version is the metadata `version`, but an update is offered whenever the branch's latest commit differs from the one you have installed — so it keeps tracking "latest code" even if a publisher pushes without bumping `version`. |
 | `release` | **Download the latest release.** Code Master reads the repo's latest GitHub *release* (`releases/latest`), installs the code at that tag, and offers an update when a newer release tag is published. The displayed version is the release tag. |
 
 Use `release` for apps that cut tagged releases (e.g. JadivCalc, which already

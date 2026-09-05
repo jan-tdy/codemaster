@@ -90,13 +90,26 @@ def _read_json(path, default):
         return default
 
 
-def _write_json(path, data):
+def _write_json(path, data, mode=None):
     # Write to a sibling temp file and atomically replace, so a crash mid-write
-    # can never leave a half-written (corrupt) config behind.
+    # can never leave a half-written (corrupt) config behind. The temp name
+    # is unique per call (mkstemp), not a fixed "<name>.tmp" — two processes
+    # (or two saves racing within one) saving the same path concurrently
+    # would otherwise share one temp file and could corrupt each other's
+    # write before either gets to the atomic replace.
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(".tmp")
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    temp_path = Path(temp_name)
     try:
-        with open(temp_path, "w", encoding="utf-8") as fh:
+        if mode is not None:
+            # Fix the mode on the fd before any content is written,
+            # overriding umask, rather than writing first and chmod-ing
+            # afterwards, which left it at default permissions for the
+            # whole write. A failure here is not swallowed — the caller
+            # decides whether an unsecured write is acceptable.
+            os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
         temp_path.replace(path)
     except Exception:
@@ -106,16 +119,34 @@ def _write_json(path, data):
 
 
 def load_config():
+    # Tighten permissions on every load too, not just after a save, so an
+    # install that predates this permission fix gets locked down as soon as
+    # Code Master next runs rather than only after its first settings save.
+    try:
+        if CONFIG_DIR.exists():
+            CONFIG_DIR.chmod(0o700)
+        if CONFIG_FILE.exists():
+            CONFIG_FILE.chmod(0o600)
+    except OSError:
+        pass
     cfg = _read_json(CONFIG_FILE, {})
     cfg.setdefault("username", DEFAULT_USERNAME)
     cfg.setdefault("branch", DEFAULT_BRANCH)
     cfg.setdefault("token", "")
     cfg.setdefault("manual_paths", [])
+    cfg.setdefault("confirmed_commands", {})
     return cfg
 
 
 def save_config(cfg):
-    _write_json(CONFIG_FILE, cfg)
+    # The token (when set) grants repo-scoped GitHub access, so keep the
+    # config file and its directory readable only by the owner. Unlike
+    # load_config()'s best-effort tightening of an existing install, a
+    # failure here is not swallowed: it's the moment the token is actually
+    # written, so callers must know if it couldn't be secured.
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.chmod(0o700)
+    _write_json(CONFIG_FILE, cfg, mode=0o600)
 
 
 def load_installed():
@@ -326,6 +357,20 @@ class CatalogLoader(QThread):
             return None
         return None
 
+    def _fetch_latest_commit(self, repo, branch):
+        """Latest commit SHA on ``branch``, used to detect updates for
+        'sync' apps whose publisher may forget to bump the metadata
+        version."""
+        url = (f"https://api.github.com/repos/{self.username}/"
+               f"{repo}/commits/{branch}")
+        try:
+            resp = requests.get(url, headers=self._headers(), timeout=20)
+            if resp.status_code == 200:
+                return resp.json().get("sha")
+        except requests.RequestException:
+            return None
+        return None
+
     def _fetch_icon(self, repo, branch, icon_path):
         if not icon_path:
             return None
@@ -353,6 +398,10 @@ class CatalogLoader(QThread):
                 if any(a.get("update_method") == "release"
                        for a in meta.get("apps", [])):
                     release_tag = self._fetch_release(repo)
+                sync_commit = None
+                if any(a.get("update_method", "sync") != "release"
+                       for a in meta.get("apps", [])):
+                    sync_commit = self._fetch_latest_commit(repo, branch)
                 for app in meta.get("apps", []):
                     icon_data = self._fetch_icon(repo, branch, app.get("icon"))
                     method = app.get("update_method", "sync")
@@ -376,6 +425,8 @@ class CatalogLoader(QThread):
                         "update_method": method,
                         "release_tag": release_tag if method == "release"
                                        else None,
+                        "latest_commit": sync_commit if method != "release"
+                                         else None,
                         "homepage": app.get("homepage")
                                     or meta.get("homepage"),
                         "private": is_private,
@@ -388,7 +439,7 @@ class CatalogLoader(QThread):
 
 class GitWorker(QThread):
     """Clone / update / install-deps without freezing the UI."""
-    done = pyqtSignal(bool, str)
+    done = pyqtSignal(bool, str, str)  # ok, message, resolved commit SHA
 
     def __init__(self, action, username, repo, repo_root, branch,
                  req_path=None, method="sync", release_tag=None, token=""):
@@ -433,6 +484,15 @@ class GitWorker(QThread):
         cmd += [url, str(self.repo_root)]
         self._run(cmd)
 
+    def _head_commit(self):
+        """The commit actually checked out in repo_root right now."""
+        try:
+            return self._run(
+                ["git", "-C", str(self.repo_root), "rev-parse", "HEAD"]
+            ).strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _install_deps(self):
         # Install into the interpreter that will actually run the app —
         # the same bare `python3` launch_app()/create_launcher() resolve
@@ -470,14 +530,18 @@ class GitWorker(QThread):
                     self._run(["git"] + self._auth_args() +
                               ["-C", str(self.repo_root), "pull",
                                "--ff-only"])
+                # Report the commit Git actually checked out, not the SHA
+                # the catalog scan saw before this ran — the branch may have
+                # advanced (or a release re-clone lands on a different
+                # commit than the last sync did) in between.
                 self.done.emit(
                     True, "Installed" if self.action == "install"
-                    else "Updated")
+                    else "Updated", self._head_commit())
             elif self.action == "deps":
                 self._install_deps()
-                self.done.emit(True, "Dependencies installed")
+                self.done.emit(True, "Dependencies installed", "")
         except Exception as exc:  # noqa: BLE001
-            self.done.emit(False, str(exc))
+            self.done.emit(False, str(exc), "")
 
 
 # --------------------------------------------------------------------------- #
@@ -774,6 +838,7 @@ class CodeMaster(QMainWindow):
         self.run_btn.clicked.connect(self.run_code)
         lay.addWidget(self.run_btn, alignment=Qt.AlignLeft)
         self._runner_process = None
+        self._runner_temp_file = None
 
         lay.addWidget(QLabel("Output:"))
         self.code_output = QTextEdit()
@@ -963,6 +1028,14 @@ class CodeMaster(QMainWindow):
                        None)
         if not catalog:
             return False
+        if catalog.get("update_method", "sync") != "release":
+            # "sync" apps track the latest commit on a branch, not a version
+            # string a publisher might forget to bump — compare commit SHAs
+            # so an update is still offered when only the code moved.
+            latest_commit = catalog.get("latest_commit")
+            if not latest_commit:
+                return False
+            return latest_commit != rec.get("commit")
         latest = self.effective_version(catalog)
         if not latest:
             return False
@@ -1000,7 +1073,7 @@ class CodeMaster(QMainWindow):
                            release_tag=app.get("release_tag"),
                            token=self.config["token"])
 
-        def finished(ok, msg):
+        def finished(ok, msg, commit=""):
             self._workers.discard(worker)
             if not ok:
                 QMessageBox.warning(self, "Install failed", msg)
@@ -1009,6 +1082,12 @@ class CodeMaster(QMainWindow):
                 "name": app["name"], "repo": app["repo"],
                 "category": app["category"],
                 "version": self.effective_version(app),
+                # Only ever the commit GitWorker actually checked out — never
+                # the pre-fetch catalog SHA. If HEAD resolution failed
+                # (rev-parse error after an otherwise successful clone/pull),
+                # this comes back empty, and the app is simply flagged as
+                # updatable again next time rather than trusting a guess.
+                "commit": commit,
                 "subdir": app.get("subdir", "."), "run": app.get("run", ""),
                 "requirements": app.get("requirements"),
                 "update_method": app.get("update_method", "sync"),
@@ -1034,7 +1113,7 @@ class CodeMaster(QMainWindow):
                            release_tag=catalog.get("release_tag"),
                            token=self.config["token"])
 
-        def finished(ok, msg):
+        def finished(ok, msg, commit=""):
             self._workers.discard(worker)
             if not ok:
                 QMessageBox.warning(self, "Update failed", msg)
@@ -1047,6 +1126,15 @@ class CodeMaster(QMainWindow):
                                 if a["key"] == key), None)
                     if cat:
                         inst["version"] = self.effective_version(cat)
+                        # Same rule as install_app: never substitute the
+                        # catalog's pre-fetch SHA for a failed HEAD resolve.
+                        inst["commit"] = commit
+                        # Pick up a publisher's changed run command too —
+                        # _resolve() overlays this stored value over the
+                        # catalog's, so a stale one here would silently keep
+                        # launching the old command (and never re-prompt via
+                        # _confirm_run, since that compares against this).
+                        inst["run"] = cat.get("run", "")
             save_installed(self.installed)
             self.refresh_views()
             self._toast(f"Updated {app['name']}")
@@ -1078,6 +1166,34 @@ class CodeMaster(QMainWindow):
         worker.start()
         self._toast(f"Installing dependencies for {app['name']}…")
 
+    def _confirm_run(self, app, run):
+        """Ask the user to confirm a publisher-supplied run command before
+        it is ever executed or baked into a launcher. The command comes
+        verbatim from ``codemaster-metadata.json`` in the app's repo, so
+        anyone who can push there controls what this runs. Re-asking is
+        skipped once the exact command has already been confirmed for this
+        app; a changed command (e.g. after an update) prompts again."""
+        confirmed = self.config.setdefault("confirmed_commands", {})
+        if confirmed.get(app["key"]) == run:
+            return True
+        resp = QMessageBox.question(
+            self, "Confirm command",
+            f"{app.get('name', app['key'])} will run this command on your "
+            f"machine:\n\n{run}\n\n"
+            "This comes from the app's publisher metadata. Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if resp != QMessageBox.Yes:
+            return False
+        confirmed[app["key"]] = run
+        try:
+            save_config(self.config)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Settings",
+                f"Confirmation was not saved, so this will ask again next "
+                f"time:\n{exc}")
+        return True
+
     def launch_app(self, app):
         app = self._resolve(app)
         repo_root = self._repo_root(app)
@@ -1092,6 +1208,14 @@ class CodeMaster(QMainWindow):
             QMessageBox.warning(self, "Launch",
                                 f"App folder not found:\n{cwd}")
             return
+        if not self._confirm_run(app, run):
+            return
+        try:
+            argv = shlex.split(run)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Launch failed",
+                                f"Could not parse run command:\n{exc}")
+            return
         # Capture stderr to a temp file (not a pipe — a long-running app that
         # logs a lot would eventually fill an unread pipe buffer and hang) so
         # that if the process dies right away (e.g. a missing dependency) we
@@ -1099,7 +1223,10 @@ class CodeMaster(QMainWindow):
         # nothing actually opens.
         log_fd, log_path = tempfile.mkstemp(prefix="codemaster-launch-")
         try:
-            proc = subprocess.Popen(run, shell=True, cwd=str(cwd),
+            # No shell=True: argv is executed directly, so shell
+            # metacharacters in a publisher-supplied run command can't be
+            # used to inject extra commands.
+            proc = subprocess.Popen(argv, cwd=str(cwd),
                                     stdout=subprocess.DEVNULL, stderr=log_fd)
         except Exception as exc:  # noqa: BLE001
             os.unlink(log_path)
@@ -1120,11 +1247,13 @@ class CodeMaster(QMainWindow):
                         encoding="utf-8", errors="replace").strip()
                 except OSError:
                     pass
-            if ret is not None:
-                try:
-                    os.unlink(log_path)
-                except OSError:
-                    pass
+            # Whether it exited or is still running, this is the only check
+            # we ever do — nothing will read the log again, so unlink it now
+            # rather than leaking one file per launch into the temp dir.
+            try:
+                os.unlink(log_path)
+            except OSError:
+                pass
             if ret not in (None, 0):
                 msg = f"{app['name']} exited immediately (code {ret})."
                 if err:
@@ -1166,6 +1295,8 @@ class CodeMaster(QMainWindow):
             QMessageBox.warning(self, "Launcher",
                                 f"App folder not found:\n{cwd}\n"
                                 "Install the app first.")
+            return
+        if not self._confirm_run(app, run):
             return
         cwd = os.path.normpath(str(cwd))
 
@@ -1281,7 +1412,12 @@ class CodeMaster(QMainWindow):
             count += 1
         if folder not in self.config["manual_paths"]:
             self.config["manual_paths"].append(folder)
-            save_config(self.config)
+            try:
+                save_config(self.config)
+            except OSError as exc:
+                QMessageBox.warning(
+                    self, "Settings",
+                    f"Could not save the manual folder list:\n{exc}")
         save_installed(self.installed)
         self.refresh_views()
         self._toast(f"Registered {count} app(s) from {repo}")
@@ -1297,7 +1433,17 @@ class CodeMaster(QMainWindow):
             or DEFAULT_USERNAME
         self.config["branch"] = self.branch_in.text().strip() or DEFAULT_BRANCH
         self.config["token"] = self.token_in.text().strip()
-        save_config(self.config)
+        try:
+            save_config(self.config)
+        except OSError as exc:
+            # This is the one save that writes the GitHub token — refuse to
+            # report success if it couldn't be written with owner-only
+            # permissions, rather than silently leaving it exposed.
+            QMessageBox.warning(
+                self, "Settings",
+                f"Could not save settings securely, so they were not "
+                f"written to disk:\n{exc}")
+            return
         self._toast("Settings saved")
         self.load_catalog()
 
@@ -1367,13 +1513,23 @@ class CodeMaster(QMainWindow):
             return
 
         code = self.code_editor.toPlainText()
-        temp_file = os.path.join(DATA_DIR, "temp_code.py")
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temp_file = None
         try:
-            with open(temp_file, "w", encoding="utf-8") as fh:
+            # A unique file per run — reusing one fixed path would let a
+            # still-running previous execution (or a second Code Master
+            # instance) read a file that's being overwritten mid-run.
+            fd, temp_file = tempfile.mkstemp(
+                prefix="codemaster-run-", suffix=".py", dir=str(DATA_DIR))
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(code)
         except Exception as exc:  # noqa: BLE001
             self.code_output.setText(str(exc))
+            if temp_file:
+                try:
+                    os.unlink(temp_file)
+                except OSError:
+                    pass
             return
 
         # Run asynchronously via QProcess so a long-running or infinite loop
@@ -1386,15 +1542,31 @@ class CodeMaster(QMainWindow):
             lambda: self.code_output.insertPlainText(
                 bytes(proc.readAll()).decode("utf-8", errors="replace")))
         proc.finished.connect(lambda *_: self._on_code_finished())
-        proc.errorOccurred.connect(
-            lambda *_: self.code_output.insertPlainText(
-                f"\n[process error: {proc.errorString()}]"))
+
+        def on_error():
+            self.code_output.insertPlainText(
+                f"\n[process error: {proc.errorString()}]")
+            # QProcess::FailedToStart never emits finished, so without this
+            # the temp file and "Stop" button state would be stuck forever.
+            # _on_code_finished() is idempotent, so calling it again for
+            # errors that *do* still emit finished (e.g. Crashed) is safe.
+            if proc.error() == QProcess.FailedToStart:
+                self._on_code_finished()
+
+        proc.errorOccurred.connect(on_error)
         self._runner_process = proc
+        self._runner_temp_file = temp_file
         proc.start(sys.executable, [temp_file])
 
     def _on_code_finished(self):
         self.run_btn.setText("Run code")
         self._runner_process = None
+        if self._runner_temp_file:
+            try:
+                os.unlink(self._runner_temp_file)
+            except OSError:
+                pass
+            self._runner_temp_file = None
         self._toast("Execution finished")
 
     # -- misc ------------------------------------------------------------- #
