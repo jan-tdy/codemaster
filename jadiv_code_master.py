@@ -15,6 +15,7 @@ Features:
 
 import sys
 import os
+import re
 import json
 import shlex
 import shutil
@@ -25,16 +26,90 @@ import base64
 import time
 from pathlib import Path
 
-import requests
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QTabWidget, QVBoxLayout, QHBoxLayout, QWidget,
-    QPushButton, QTextEdit, QLineEdit, QLabel, QScrollArea, QFrame, QGridLayout,
-    QSizePolicy, QFileDialog, QMessageBox, QCheckBox, QFormLayout
-)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QProcess, QTimer
-from PyQt5.QtGui import QPixmap, QColor, QPainter, QFont
-
 APP_NAME = "Jadiv Code Master"
+
+
+def _report_missing_dependency(exc):
+    """
+    Report a startup dependency error through stderr and an available graphical notification.
+    
+    Parameters:
+        exc (Exception): The error that prevented the application from starting.
+    """
+    message = (
+        f"{APP_NAME} could not start: {exc}\n\n"
+        "Install the required packages first:\n"
+        "    sudo apt install python3-pyqt5 python3-requests\n"
+        "or, if you prefer pip:\n"
+        "    python3 -m pip install --user -r requirements.txt"
+    )
+    print(message, file=sys.stderr)
+    try:
+        import tkinter
+        from tkinter import messagebox
+        root = tkinter.Tk()
+        root.withdraw()
+        messagebox.showerror(APP_NAME, message)
+        root.destroy()
+        return
+    except Exception:
+        pass
+    for cmd in (["zenity", "--error", "--title", APP_NAME, "--text", message],
+                ["notify-send", "--urgency=critical", APP_NAME, message]):
+        try:
+            subprocess.run(cmd, check=False)
+            return
+        except FileNotFoundError:
+            continue
+
+
+def _requirement_name(requirement):
+    """The bare package name at the start of a requirements.txt line."""
+    return re.split(r"[<>=!~\[; ]", requirement.strip(), maxsplit=1)[0]
+
+
+def _apt_package_name(requirement):
+    """Best-effort mapping of a requirements.txt line to a Debian package
+    name, e.g. 'PyQt5>=5.15,<6' -> 'python3-pyqt5'."""
+    return "python3-" + _requirement_name(requirement).lower().replace("_", "-")
+
+
+def _apt_requirement_satisfied(requirement):
+    """Whether the package apt just installed actually satisfies
+    ``requirement``.
+
+    A bare requirement (no version constraint) is always satisfied — apt's
+    current version is fine. A constrained one (e.g. "requests>=2.32.4,<3")
+    is only accepted when the optional `packaging` library can parse it and
+    confirm the installed version matches: apt may ship an older or newer
+    release than the pin, and trusting apt-get's exit code alone would
+    silently accept whichever version it happened to install.
+    """
+    if _requirement_name(requirement) == requirement.strip():
+        return True
+    try:
+        from packaging.requirements import Requirement
+        from importlib.metadata import version as installed_version
+        req = Requirement(requirement)
+        return req.specifier.contains(installed_version(req.name),
+                                       prereleases=True)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+try:
+    import requests
+    from PyQt5.QtWidgets import (
+        QApplication, QMainWindow, QTabWidget, QVBoxLayout, QHBoxLayout, QWidget,
+        QPushButton, QTextEdit, QLineEdit, QLabel, QScrollArea, QFrame, QGridLayout,
+        QSizePolicy, QFileDialog, QMessageBox, QCheckBox, QFormLayout
+    )
+    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QProcess, QTimer
+    from PyQt5.QtGui import QPixmap, QColor, QPainter, QFont
+except ImportError as exc:
+    _report_missing_dependency(exc)
+    sys.exit(1)
+
 APP_VERSION = "0.3.0"
 DEFAULT_USERNAME = "jan-tdy"
 DEFAULT_BRANCH = "main"
@@ -524,7 +599,43 @@ class GitWorker(QThread):
         except Exception:  # noqa: BLE001
             return ""
 
+    def _install_via_apt(self, requirements):
+        """Best-effort install of the distro's own packages via apt.
+
+        Preferred over pip: apt packages don't fight PEP 668's
+        "externally-managed-environment" restriction, so we never need
+        --break-system-packages, which can destabilize the system Python.
+        Returns True only when apt-get reports success for every mapped
+        package name *and* the installed version actually satisfies each
+        requirement; the caller falls back to pip otherwise (e.g. a
+        requirement with no Debian package, an apt version that doesn't
+        meet a pin, or no polkit agent running).
+        """
+        apt_get = shutil.which("apt-get")
+        pkexec = shutil.which("pkexec")
+        if not apt_get or not pkexec:
+            return False
+        packages = sorted({_apt_package_name(r) for r in requirements})
+        try:
+            self._run([pkexec, apt_get, "install", "-y"] + packages)
+        except Exception:  # noqa: BLE001
+            return False
+        return all(_apt_requirement_satisfied(r) for r in requirements)
+
     def _install_deps(self):
+        """Install the application's dependencies from its requirements file, using system packages when available and otherwise installing them with Python's package manager."""
+        try:
+            requirements = [
+                line.strip() for line in
+                Path(self.req_path).read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+        except OSError:
+            requirements = []
+
+        if requirements and self._install_via_apt(requirements):
+            return
+
         # Install into the interpreter that will actually run the app —
         # the same bare `python3` launch_app()/create_launcher() resolve
         # via PATH — not Code Master's own sys.executable. The two can be
@@ -533,19 +644,31 @@ class GitWorker(QThread):
         # dependency installed into one is invisible to the other: pip
         # reports success, but the app still fails to import it when run.
         python = shutil.which("python3") or sys.executable
-        cmd = [python, "-m", "pip", "install", "-r", str(self.req_path)]
+        cmd = [python, "-m", "pip", "install", "--user", "-r", str(self.req_path)]
         try:
             self._run(cmd)
         except RuntimeError as exc:
-            if "externally-managed-environment" not in str(exc):
+            if "externally-managed-environment" not in str(exc) or not requirements:
                 raise
-            # PEP 668: the system Python refuses direct installs. Retry as
-            # a --user install with the override flag, matching what pip's
-            # own error message recommends, so deps actually land instead
-            # of failing outright on Debian/Ubuntu/Arch and the like.
-            self._run(cmd + ["--user", "--break-system-packages"])
+            # PEP 668: pip refuses, and we don't override it with
+            # --break-system-packages. Point at the exact apt packages to
+            # install by hand instead of leaving a bare pip stderr dump.
+            packages = " ".join(sorted({_apt_package_name(r)
+                                         for r in requirements}))
+            raise RuntimeError(
+                f"{exc}\n\nThis system's Python blocks direct pip installs "
+                f"(PEP 668) and apt doesn't have a matching version. "
+                f"Install manually with:\n    sudo apt install {packages}"
+            ) from exc
 
     def run(self):
+        """
+        Execute the requested repository operation and emit its result.
+        
+        Installation and update actions clone or update the repository, while dependency
+        actions install the application's declared dependencies. Failures are reported
+        through the completion signal.
+        """
         try:
             # "release" apps track a tagged GitHub release; "sync" apps track
             # the latest code on a branch.
