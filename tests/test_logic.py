@@ -3,6 +3,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import requests
+
 import jadiv_code_master as cm
 
 
@@ -135,3 +137,73 @@ def test_installed_apps_falls_back_when_not_in_catalog():
     apps = store._installed_apps()
     assert apps[0]["key"] == "repo/app"
     assert apps[0]["name"] == "App"
+
+
+# -- CatalogLoader rate limit handling ---------------------------------------- #
+class _FakeResponse:
+    def __init__(self, status_code, headers=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+
+    def raise_for_status(self):
+        """
+        Raise an HTTP error when the response indicates a failed request.
+        
+        Raises:
+            requests.HTTPError: If the response status code is 400 or higher.
+        """
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code} error")
+
+
+def _bare_loader(token=""):
+    """Create an uninitialized catalog loader with the specified authentication token.
+    
+    Parameters:
+    	token (str): Authentication token assigned to the loader.
+    
+    Returns:
+    	CatalogLoader: A loader instance configured with the token.
+    """
+    loader = cm.CatalogLoader.__new__(cm.CatalogLoader)
+    loader.token = token
+    return loader
+
+
+def test_raise_for_status_reports_rate_limit_without_token():
+    loader = _bare_loader(token="")
+    resp = _FakeResponse(403, {"X-RateLimit-Remaining": "0",
+                               "X-RateLimit-Reset": "1893456000"})
+    try:
+        loader._raise_for_status(resp)
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert "rate limit" in str(exc).lower()
+        assert "Manual & Settings" in str(exc)
+
+
+def test_raise_for_status_reports_rate_limit_with_token():
+    loader = _bare_loader(token="ghp_dummy")
+    resp = _FakeResponse(403, {"X-RateLimit-Remaining": "0"})
+    try:
+        loader._raise_for_status(resp)
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert "rate limit" in str(exc).lower()
+        assert "try again later" in str(exc).lower()
+
+
+def test_raise_for_status_passes_through_non_rate_limit_403():
+    loader = _bare_loader()
+    resp = _FakeResponse(403, {})
+    try:
+        loader._raise_for_status(resp)
+        assert False, "expected HTTPError"
+    except requests.HTTPError:
+        pass
+
+
+def test_raise_for_status_ignores_healthy_response():
+    loader = _bare_loader()
+    resp = _FakeResponse(200, {})
+    loader._raise_for_status(resp)  # must not raise

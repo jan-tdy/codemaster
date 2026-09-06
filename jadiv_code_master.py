@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import hashlib
 import base64
+import time
 from pathlib import Path
 
 import requests
@@ -269,11 +270,48 @@ class CatalogLoader(QThread):
         self.token = token
 
     def _headers(self):
+        """Build the optional GitHub API authorization headers.
+        
+        Returns:
+        	dict: An authorization header when a token is configured; otherwise, an empty dictionary.
+        """
         return {"Authorization": f"token {self.token}"} if self.token else {}
 
+    def _raise_for_status(self, resp):
+        """
+        Raise an actionable error when GitHub API rate limits are exhausted.
+        
+        Parameters:
+            resp: The GitHub API response to validate.
+        
+        Raises:
+            RuntimeError: If the GitHub API rate limit is exhausted.
+            requests.HTTPError: If the response indicates another HTTP error.
+        """
+        if resp.status_code == 403 and \
+                resp.headers.get("X-RateLimit-Remaining") == "0":
+            when = ""
+            reset = resp.headers.get("X-RateLimit-Reset")
+            if reset:
+                try:
+                    when = (" It resets at "
+                            f"{time.strftime('%H:%M', time.localtime(int(reset)))}.")
+                except (ValueError, OSError, OverflowError):
+                    pass
+            hint = ("Add a GitHub token in Manual & Settings → GitHub "
+                    "token to raise the limit." if not self.token else
+                    "Your configured GitHub token has also hit its rate "
+                    "limit — try again later.")
+            raise RuntimeError(
+                f"GitHub API rate limit reached.{when} {hint}")
+        resp.raise_for_status()
+
     def _authenticated_login(self):
-        """Login the configured token belongs to, or None if it can't be
-        determined (no token, request failure, ...)."""
+        """Determine the GitHub account associated with the configured token.
+        
+        Returns:
+            str | None: The authenticated GitHub login, or `None` if it cannot be determined.
+        """
         try:
             resp = requests.get("https://api.github.com/user",
                                 headers=self._headers(), timeout=20)
@@ -283,19 +321,12 @@ class CatalogLoader(QThread):
             return None
 
     def _list_repos(self):
-        """List every repo owned by ``self.username``.
-
-        ``/users/{username}/repos`` only ever returns public repositories,
-        no matter who is authenticated. To also see private repos we need
-        ``/user/repos`` (the *authenticated* user's own repos, public and
-        private) — but that only lists ``self.username``'s repos if the
-        configured token actually belongs to that account. A token for a
-        different account (e.g. someone's own PAT, added just to raise the
-        rate limit while browsing jan-tdy's public repos) would otherwise
-        make every repo fail the owner filter below and return an empty
-        catalog. Verify the token owner first; fall back to the public
-        listing (still with the token in headers, for the rate-limit
-        benefit) when it doesn't match."""
+        """List repositories owned by the configured GitHub user.
+        
+        Returns:
+            list[tuple[str, str, bool]]: Repository name, default branch, and private
+            status for each owned repository.
+        """
         repos, page = [], 1
         use_user_repos = False
         if self.token:
@@ -311,7 +342,7 @@ class CatalogLoader(QThread):
         while True:
             url = f"{url_base}?per_page=100&page={page}{extra}"
             resp = requests.get(url, headers=self._headers(), timeout=20)
-            resp.raise_for_status()
+            self._raise_for_status(resp)
             chunk = resp.json()
             if not chunk:
                 break
