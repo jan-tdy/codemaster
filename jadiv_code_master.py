@@ -25,16 +25,57 @@ import base64
 import time
 from pathlib import Path
 
-import requests
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QTabWidget, QVBoxLayout, QHBoxLayout, QWidget,
-    QPushButton, QTextEdit, QLineEdit, QLabel, QScrollArea, QFrame, QGridLayout,
-    QSizePolicy, QFileDialog, QMessageBox, QCheckBox, QFormLayout
-)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QProcess, QTimer
-from PyQt5.QtGui import QPixmap, QColor, QPainter, QFont
-
 APP_NAME = "Jadiv Code Master"
+
+
+def _report_missing_dependency(exc):
+    """Show a visible error when PyQt5 or requests is missing.
+
+    Launched via the .desktop entry (Terminal=false), an unhandled
+    ImportError's traceback goes nowhere visible — the app just appears to
+    do nothing when clicked from the application menu (issue #19). Fall
+    back through whatever GUI-error mechanism is actually available.
+    """
+    message = (
+        f"{APP_NAME} could not start: {exc}\n\n"
+        "Install the required Python packages first:\n"
+        "    python3 -m pip install --user -r requirements.txt\n"
+        "(add --break-system-packages if pip refuses with "
+        "'externally-managed-environment')"
+    )
+    print(message, file=sys.stderr)
+    try:
+        import tkinter
+        from tkinter import messagebox
+        root = tkinter.Tk()
+        root.withdraw()
+        messagebox.showerror(APP_NAME, message)
+        root.destroy()
+        return
+    except Exception:
+        pass
+    for cmd in (["zenity", "--error", "--title", APP_NAME, "--text", message],
+                ["notify-send", "--urgency=critical", APP_NAME, message]):
+        try:
+            subprocess.run(cmd, check=False)
+            return
+        except FileNotFoundError:
+            continue
+
+
+try:
+    import requests
+    from PyQt5.QtWidgets import (
+        QApplication, QMainWindow, QTabWidget, QVBoxLayout, QHBoxLayout, QWidget,
+        QPushButton, QTextEdit, QLineEdit, QLabel, QScrollArea, QFrame, QGridLayout,
+        QSizePolicy, QFileDialog, QMessageBox, QCheckBox, QFormLayout
+    )
+    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QProcess, QTimer
+    from PyQt5.QtGui import QPixmap, QColor, QPainter, QFont
+except ImportError as exc:
+    _report_missing_dependency(exc)
+    sys.exit(1)
+
 APP_VERSION = "0.3.0"
 DEFAULT_USERNAME = "jan-tdy"
 DEFAULT_BRANCH = "main"
