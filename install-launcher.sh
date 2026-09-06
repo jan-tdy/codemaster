@@ -42,19 +42,18 @@ do_install() {
         exit 1
     fi
     if ! python3 -c "import PyQt5, requests" >/dev/null 2>&1; then
-        # Plain "pip" can resolve to a different interpreter than the
-        # "python3" the .desktop launcher runs (Exec=python3 ...), so a
-        # package it installs may be invisible to the app. Always go
-        # through "python3 -m pip" so it lands in the same interpreter.
-        # Debian/Ubuntu/Arch also refuse a direct pip install into the
-        # system Python (PEP 668, "externally-managed-environment"); the
-        # --user --break-system-packages combination is what pip's own
-        # error message recommends as the override.
+        # Prefer the distro's own packages: they don't fight PEP 668's
+        # "externally-managed-environment" restriction, so there's no need
+        # for pip's --break-system-packages override, which can destabilize
+        # the system Python. Plain "pip" can also resolve to a different
+        # interpreter than the "python3" the .desktop launcher runs
+        # (Exec=python3 ...), so a package it installs may be invisible to
+        # the app; "python3 -m pip" avoids that.
         echo "Warning: PyQt5 or requests is not installed. Install them with:" >&2
+        echo "    sudo apt install python3-pyqt5 python3-requests" >&2
+        echo "or, if you prefer pip:" >&2
         printf '    python3 -m pip install --user -r %q\n' \
             "$REPO_DIR/requirements.txt" >&2
-        echo "    (add --break-system-packages if pip refuses with" >&2
-        echo "     'externally-managed-environment')" >&2
     fi
 
     mkdir -p "$APP_DIR" "$ICON_DIR"

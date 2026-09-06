@@ -15,6 +15,7 @@ Features:
 
 import sys
 import os
+import re
 import json
 import shlex
 import shutil
@@ -38,10 +39,10 @@ def _report_missing_dependency(exc):
     """
     message = (
         f"{APP_NAME} could not start: {exc}\n\n"
-        "Install the required Python packages first:\n"
-        "    python3 -m pip install --user -r requirements.txt\n"
-        "(add --break-system-packages if pip refuses with "
-        "'externally-managed-environment')"
+        "Install the required packages first:\n"
+        "    sudo apt install python3-pyqt5 python3-requests\n"
+        "or, if you prefer pip:\n"
+        "    python3 -m pip install --user -r requirements.txt"
     )
     print(message, file=sys.stderr)
     try:
@@ -61,6 +62,13 @@ def _report_missing_dependency(exc):
             return
         except FileNotFoundError:
             continue
+
+
+def _apt_package_name(requirement):
+    """Best-effort mapping of a requirements.txt line to a Debian package
+    name, e.g. 'PyQt5>=5.15,<6' -> 'python3-pyqt5'."""
+    name = re.split(r"[<>=!~\[; ]", requirement.strip(), maxsplit=1)[0]
+    return "python3-" + name.lower().replace("_", "-")
 
 
 try:
@@ -565,7 +573,40 @@ class GitWorker(QThread):
         except Exception:  # noqa: BLE001
             return ""
 
+    def _install_via_apt(self, requirements):
+        """Best-effort install of the distro's own packages via apt.
+
+        Preferred over pip: apt packages don't fight PEP 668's
+        "externally-managed-environment" restriction, so we never need
+        --break-system-packages, which can destabilize the system Python.
+        Returns True only when apt-get reports success for every mapped
+        package name; the caller falls back to pip otherwise (e.g. a
+        requirement with no Debian package, or no polkit agent running).
+        """
+        apt_get = shutil.which("apt-get")
+        pkexec = shutil.which("pkexec")
+        if not apt_get or not pkexec:
+            return False
+        packages = sorted({_apt_package_name(r) for r in requirements})
+        try:
+            self._run([pkexec, apt_get, "install", "-y"] + packages)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     def _install_deps(self):
+        try:
+            requirements = [
+                line.strip() for line in
+                Path(self.req_path).read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+        except OSError:
+            requirements = []
+
+        if requirements and self._install_via_apt(requirements):
+            return
+
         # Install into the interpreter that will actually run the app —
         # the same bare `python3` launch_app()/create_launcher() resolve
         # via PATH — not Code Master's own sys.executable. The two can be
@@ -574,17 +615,8 @@ class GitWorker(QThread):
         # dependency installed into one is invisible to the other: pip
         # reports success, but the app still fails to import it when run.
         python = shutil.which("python3") or sys.executable
-        cmd = [python, "-m", "pip", "install", "-r", str(self.req_path)]
-        try:
-            self._run(cmd)
-        except RuntimeError as exc:
-            if "externally-managed-environment" not in str(exc):
-                raise
-            # PEP 668: the system Python refuses direct installs. Retry as
-            # a --user install with the override flag, matching what pip's
-            # own error message recommends, so deps actually land instead
-            # of failing outright on Debian/Ubuntu/Arch and the like.
-            self._run(cmd + ["--user", "--break-system-packages"])
+        self._run([python, "-m", "pip", "install", "--user",
+                   "-r", str(self.req_path)])
 
     def run(self):
         try:

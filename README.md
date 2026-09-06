@@ -22,8 +22,9 @@ publishes the Telescope Cover, Astrofoto, Atacama (C14) and DSLR apps.
   fresh scan runs in the background.
 - **📲 Installed** — **launch**, **update** or **remove** apps, **add them to
   your application menu** (creates a `.desktop` launcher with the app's icon),
-  and install an app's Python dependencies (`pip install -r …`) when it
-  declares a requirements file.
+  and install an app's dependencies when it declares a requirements file
+  (tries `apt install python3-<package>` for each one first, falling back
+  to `pip install --user` only for packages apt doesn't have).
 - **⟳ Updates** — installed apps whose published version is newer than the one
   you have are listed here; update them individually or all at once. Code
   Master both **installs and updates** apps (`sync` apps via `git pull`,
@@ -47,15 +48,23 @@ publishes the Telescope Cover, Astrofoto, Atacama (C14) and DSLR apps.
 ## Running
 
 ```bash
+sudo apt install python3-pyqt5 python3-requests   # Debian/Ubuntu
+python3 jadiv_code_master.py
+```
+
+Prefer your distro's own packages over pip: on Debian/Ubuntu/Arch and other
+distros with [PEP 668](https://peps.python.org/pep-0668/) "externally managed"
+system Pythons, a direct `pip install` is refused unless you pass
+`--break-system-packages`, which can destabilize the system Python — `apt`
+sidesteps that entirely. If you'd rather use pip anyway:
+
+```bash
 python3 -m pip install --user -r requirements.txt   # PyQt5.QtSvg is needed for SVG icons
 python3 jadiv_code_master.py
 ```
 
 `python3 -m pip` (rather than a bare `pip`) guarantees the packages land in the
-same interpreter that actually runs the app. On Debian/Ubuntu/Arch and other
-distros with [PEP 668](https://peps.python.org/pep-0668/) "externally managed"
-system Pythons, add `--break-system-packages` if pip refuses with an
-`externally-managed-environment` error.
+same interpreter that actually runs the app.
 
 ### Desktop launcher
 
