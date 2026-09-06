@@ -30,12 +30,11 @@ APP_NAME = "Jadiv Code Master"
 
 
 def _report_missing_dependency(exc):
-    """Show a visible error when PyQt5 or requests is missing.
-
-    Launched via the .desktop entry (Terminal=false), an unhandled
-    ImportError's traceback goes nowhere visible — the app just appears to
-    do nothing when clicked from the application menu (issue #19). Fall
-    back through whatever GUI-error mechanism is actually available.
+    """
+    Report a startup dependency error through stderr and an available graphical notification.
+    
+    Parameters:
+        exc (Exception): The error that prevented the application from starting.
     """
     message = (
         f"{APP_NAME} could not start: {exc}\n\n"
@@ -65,8 +64,15 @@ def _report_missing_dependency(exc):
 
 
 def _apt_package_name(requirement):
-    """Best-effort mapping of a requirements.txt line to a Debian package
-    name, e.g. 'PyQt5>=5.15,<6' -> 'python3-pyqt5'."""
+    """
+    Map a Python requirement to an approximate Debian package name.
+    
+    Parameters:
+        requirement (str): A Python requirement specification.
+    
+    Returns:
+        str: A Debian package name prefixed with ``python3-``.
+    """
     name = re.split(r"[<>=!~\[; ]", requirement.strip(), maxsplit=1)[0]
     return "python3-" + name.lower().replace("_", "-")
 
@@ -565,7 +571,12 @@ class GitWorker(QThread):
         self._run(cmd)
 
     def _head_commit(self):
-        """The commit actually checked out in repo_root right now."""
+        """
+        Get the commit hash currently checked out in the repository.
+        
+        Returns:
+            str: The checked-out commit hash, or an empty string if it cannot be determined.
+        """
         try:
             return self._run(
                 ["git", "-C", str(self.repo_root), "rev-parse", "HEAD"]
@@ -574,14 +585,14 @@ class GitWorker(QThread):
             return ""
 
     def _install_via_apt(self, requirements):
-        """Best-effort install of the distro's own packages via apt.
-
-        Preferred over pip: apt packages don't fight PEP 668's
-        "externally-managed-environment" restriction, so we never need
-        --break-system-packages, which can destabilize the system Python.
-        Returns True only when apt-get reports success for every mapped
-        package name; the caller falls back to pip otherwise (e.g. a
-        requirement with no Debian package, or no polkit agent running).
+        """
+        Attempt to install Python requirements as Debian packages.
+        
+        Parameters:
+            requirements: Requirement specifications to convert to Debian package names.
+        
+        Returns:
+            bool: `True` if apt successfully installs all mapped packages, `False` if apt or pkexec is unavailable or installation fails.
         """
         apt_get = shutil.which("apt-get")
         pkexec = shutil.which("pkexec")
@@ -595,6 +606,7 @@ class GitWorker(QThread):
             return False
 
     def _install_deps(self):
+        """Install the application's dependencies from its requirements file, using system packages when available and otherwise installing them with Python's package manager."""
         try:
             requirements = [
                 line.strip() for line in
@@ -619,6 +631,13 @@ class GitWorker(QThread):
                    "-r", str(self.req_path)])
 
     def run(self):
+        """
+        Execute the requested repository operation and emit its result.
+        
+        Installation and update actions clone or update the repository, while dependency
+        actions install the application's declared dependencies. Failures are reported
+        through the completion signal.
+        """
         try:
             # "release" apps track a tagged GitHub release; "sync" apps track
             # the latest code on a branch.

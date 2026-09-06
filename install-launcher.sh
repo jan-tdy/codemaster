@@ -35,6 +35,7 @@ do_uninstall() {
     echo "Removed Jadiv Code Master launcher."
 }
 
+# do_install installs the per-user Jadiv Code Master desktop launcher and icon, then refreshes application caches.
 do_install() {
     # Sanity check: make sure the app and its dependencies are reachable.
     if ! command -v python3 >/dev/null 2>&1; then
