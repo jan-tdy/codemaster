@@ -65,7 +65,11 @@ do_install() {
     # path — spaces, backslashes, ampersands, etc.
     python3 -c 'import sys; sys.stdout.write(sys.stdin.read().replace("__INSTALL_DIR__", sys.argv[1]))' \
         "$REPO_DIR" < "$ASSETS_DIR/$DESKTOP_FILE" > "$APP_DIR/$DESKTOP_FILE"
-    chmod 0644 "$APP_DIR/$DESKTOP_FILE"
+    # Executable, not just readable: some file managers (e.g. Thunar) treat a
+    # non-executable .desktop file as untrusted and offer to import it as a
+    # panel launcher instead of running it, which fails with a confusing
+    # "Failed to add a plugin to the panel" D-Bus error unrelated to this app.
+    chmod 0755 "$APP_DIR/$DESKTOP_FILE"
 
     update_caches
     echo "Installed Jadiv Code Master launcher into $APP_DIR"

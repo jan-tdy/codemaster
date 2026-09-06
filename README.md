@@ -71,6 +71,15 @@ This installs `assets/codemaster.desktop` into `~/.local/share/applications/`
 `~/.local/share/icons/hicolor/scalable/apps/`, then refreshes the desktop and
 icon caches. Look for *Jadiv Code Master* in your launcher.
 
+> **Don't double-click `assets/codemaster.desktop` in a file manager** — it
+> still has the `__INSTALL_DIR__` placeholder, so it won't run. Some file
+> managers (e.g. Thunar on Xfce) also treat a plain `.desktop` file opened
+> from an arbitrary folder as untrusted and try to *import it as a panel
+> launcher* instead of running it, which fails with an unrelated
+> `Failed to add a plugin to the panel: … org.xfce.Panel was not provided by
+> any .service files` error. Always use `./install-launcher.sh` to install
+> the launcher, then start it from your application menu.
+
 Code Master keeps its state in:
 
 | Path | Purpose |
