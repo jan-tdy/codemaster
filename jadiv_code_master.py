@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import hashlib
 import base64
+import time
 from pathlib import Path
 
 import requests
@@ -271,6 +272,28 @@ class CatalogLoader(QThread):
     def _headers(self):
         return {"Authorization": f"token {self.token}"} if self.token else {}
 
+    def _raise_for_status(self, resp):
+        """Like ``resp.raise_for_status()``, but turns an exhausted GitHub
+        rate limit into an actionable message instead of a generic HTTP
+        error, so the user knows *why* the scan failed and how to fix it."""
+        if resp.status_code == 403 and \
+                resp.headers.get("X-RateLimit-Remaining") == "0":
+            when = ""
+            reset = resp.headers.get("X-RateLimit-Reset")
+            if reset:
+                try:
+                    when = (" It resets at "
+                            f"{time.strftime('%H:%M', time.localtime(int(reset)))}.")
+                except (ValueError, OSError, OverflowError):
+                    pass
+            hint = ("Add a GitHub token in Manual & Settings → GitHub "
+                    "token to raise the limit." if not self.token else
+                    "Your configured GitHub token has also hit its rate "
+                    "limit — try again later.")
+            raise RuntimeError(
+                f"GitHub API rate limit reached.{when} {hint}")
+        resp.raise_for_status()
+
     def _authenticated_login(self):
         """Login the configured token belongs to, or None if it can't be
         determined (no token, request failure, ...)."""
@@ -311,7 +334,7 @@ class CatalogLoader(QThread):
         while True:
             url = f"{url_base}?per_page=100&page={page}{extra}"
             resp = requests.get(url, headers=self._headers(), timeout=20)
-            resp.raise_for_status()
+            self._raise_for_status(resp)
             chunk = resp.json()
             if not chunk:
                 break
