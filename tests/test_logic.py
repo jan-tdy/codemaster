@@ -29,6 +29,29 @@ def test_desktop_exec_line_wraps_cd_and_run():
     assert line == 'sh -c "cd /home/user/App && python3 app.py"'
 
 
+# -- apt dependency mapping --------------------------------------------------- #
+def test_apt_package_name_strips_version_constraint():
+    assert cm._apt_package_name("PyQt5>=5.15,<6") == "python3-pyqt5"
+
+
+def test_apt_package_name_normalizes_underscores():
+    assert cm._apt_package_name("some_package==1.0") == "python3-some-package"
+
+
+def test_apt_requirement_satisfied_is_true_for_bare_requirement():
+    assert cm._apt_requirement_satisfied("requests") is True
+
+
+def test_apt_requirement_satisfied_checks_installed_version():
+    installed = requests.__version__
+    assert cm._apt_requirement_satisfied(f"requests=={installed}") is True
+    assert cm._apt_requirement_satisfied("requests==0.0.1") is False
+
+
+def test_apt_requirement_satisfied_false_for_unknown_package():
+    assert cm._apt_requirement_satisfied("not-a-real-package>=1.0") is False
+
+
 # -- xdg data home ----------------------------------------------------------- #
 def test_xdg_data_home_defaults_when_env_unset(monkeypatch):
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)

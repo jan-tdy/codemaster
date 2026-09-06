@@ -64,11 +64,38 @@ def _report_missing_dependency(exc):
             continue
 
 
+def _requirement_name(requirement):
+    """The bare package name at the start of a requirements.txt line."""
+    return re.split(r"[<>=!~\[; ]", requirement.strip(), maxsplit=1)[0]
+
+
 def _apt_package_name(requirement):
     """Best-effort mapping of a requirements.txt line to a Debian package
     name, e.g. 'PyQt5>=5.15,<6' -> 'python3-pyqt5'."""
-    name = re.split(r"[<>=!~\[; ]", requirement.strip(), maxsplit=1)[0]
-    return "python3-" + name.lower().replace("_", "-")
+    return "python3-" + _requirement_name(requirement).lower().replace("_", "-")
+
+
+def _apt_requirement_satisfied(requirement):
+    """Whether the package apt just installed actually satisfies
+    ``requirement``.
+
+    A bare requirement (no version constraint) is always satisfied — apt's
+    current version is fine. A constrained one (e.g. "requests>=2.32.4,<3")
+    is only accepted when the optional `packaging` library can parse it and
+    confirm the installed version matches: apt may ship an older or newer
+    release than the pin, and trusting apt-get's exit code alone would
+    silently accept whichever version it happened to install.
+    """
+    if _requirement_name(requirement) == requirement.strip():
+        return True
+    try:
+        from packaging.requirements import Requirement
+        from importlib.metadata import version as installed_version
+        req = Requirement(requirement)
+        return req.specifier.contains(installed_version(req.name),
+                                       prereleases=True)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 try:
@@ -580,8 +607,10 @@ class GitWorker(QThread):
         "externally-managed-environment" restriction, so we never need
         --break-system-packages, which can destabilize the system Python.
         Returns True only when apt-get reports success for every mapped
-        package name; the caller falls back to pip otherwise (e.g. a
-        requirement with no Debian package, or no polkit agent running).
+        package name *and* the installed version actually satisfies each
+        requirement; the caller falls back to pip otherwise (e.g. a
+        requirement with no Debian package, an apt version that doesn't
+        meet a pin, or no polkit agent running).
         """
         apt_get = shutil.which("apt-get")
         pkexec = shutil.which("pkexec")
@@ -590,9 +619,9 @@ class GitWorker(QThread):
         packages = sorted({_apt_package_name(r) for r in requirements})
         try:
             self._run([pkexec, apt_get, "install", "-y"] + packages)
-            return True
         except Exception:  # noqa: BLE001
             return False
+        return all(_apt_requirement_satisfied(r) for r in requirements)
 
     def _install_deps(self):
         try:
@@ -615,8 +644,22 @@ class GitWorker(QThread):
         # dependency installed into one is invisible to the other: pip
         # reports success, but the app still fails to import it when run.
         python = shutil.which("python3") or sys.executable
-        self._run([python, "-m", "pip", "install", "--user",
-                   "-r", str(self.req_path)])
+        cmd = [python, "-m", "pip", "install", "--user", "-r", str(self.req_path)]
+        try:
+            self._run(cmd)
+        except RuntimeError as exc:
+            if "externally-managed-environment" not in str(exc) or not requirements:
+                raise
+            # PEP 668: pip refuses, and we don't override it with
+            # --break-system-packages. Point at the exact apt packages to
+            # install by hand instead of leaving a bare pip stderr dump.
+            packages = " ".join(sorted({_apt_package_name(r)
+                                         for r in requirements}))
+            raise RuntimeError(
+                f"{exc}\n\nThis system's Python blocks direct pip installs "
+                f"(PEP 668) and apt doesn't have a matching version. "
+                f"Install manually with:\n    sudo apt install {packages}"
+            ) from exc
 
     def run(self):
         try:
