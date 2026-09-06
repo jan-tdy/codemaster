@@ -30,12 +30,11 @@ APP_NAME = "Jadiv Code Master"
 
 
 def _report_missing_dependency(exc):
-    """Show a visible error when PyQt5 or requests is missing.
-
-    Launched via the .desktop entry (Terminal=false), an unhandled
-    ImportError's traceback goes nowhere visible — the app just appears to
-    do nothing when clicked from the application menu (issue #19). Fall
-    back through whatever GUI-error mechanism is actually available.
+    """
+    Report a startup dependency error through stderr and an available graphical notification.
+    
+    Parameters:
+        exc (Exception): The error that prevented the application from starting.
     """
     message = (
         f"{APP_NAME} could not start: {exc}\n\n"
@@ -624,6 +623,7 @@ class GitWorker(QThread):
         return all(_apt_requirement_satisfied(r) for r in requirements)
 
     def _install_deps(self):
+        """Install the application's dependencies from its requirements file, using system packages when available and otherwise installing them with Python's package manager."""
         try:
             requirements = [
                 line.strip() for line in
@@ -662,6 +662,13 @@ class GitWorker(QThread):
             ) from exc
 
     def run(self):
+        """
+        Execute the requested repository operation and emit its result.
+        
+        Installation and update actions clone or update the repository, while dependency
+        actions install the application's declared dependencies. Failures are reported
+        through the completion signal.
+        """
         try:
             # "release" apps track a tagged GitHub release; "sync" apps track
             # the latest code on a branch.
