@@ -146,11 +146,25 @@ class _FakeResponse:
         self.headers = headers or {}
 
     def raise_for_status(self):
+        """
+        Raise an HTTP error when the response indicates a failed request.
+        
+        Raises:
+            requests.HTTPError: If the response status code is 400 or higher.
+        """
         if self.status_code >= 400:
             raise requests.HTTPError(f"{self.status_code} error")
 
 
 def _bare_loader(token=""):
+    """Create an uninitialized catalog loader with the specified authentication token.
+    
+    Parameters:
+    	token (str): Authentication token assigned to the loader.
+    
+    Returns:
+    	CatalogLoader: A loader instance configured with the token.
+    """
     loader = cm.CatalogLoader.__new__(cm.CatalogLoader)
     loader.token = token
     return loader
