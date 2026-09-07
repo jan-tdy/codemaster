@@ -590,6 +590,35 @@ class GitWorker(QThread):
         cmd += [url, str(self.repo_root)]
         self._run(cmd)
 
+    def _current_branch(self):
+        """The branch checked out in repo_root, or "" when detached/unknown."""
+        try:
+            return self._run(
+                ["git", "-C", str(self.repo_root),
+                 "rev-parse", "--abbrev-ref", "HEAD"]
+            ).strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _switch_branch(self, branch):
+        """Move an existing clone onto ``branch``.
+
+        Clones are shallow (``--depth 1 --branch <branch>``), so the other
+        branches aren't in the clone at all and a plain checkout fails —
+        the branch has to be fetched first. If the switch fails anyway
+        (local state in the way, history too shallow to connect), fall
+        back to a fresh clone at the requested branch.
+        """
+        try:
+            self._run(["git"] + self._auth_args() +
+                      ["-C", str(self.repo_root), "fetch", "--depth", "1",
+                       "origin",
+                       f"+refs/heads/{branch}:refs/remotes/origin/{branch}"])
+            self._run(["git", "-C", str(self.repo_root), "checkout",
+                       "-B", branch, f"origin/{branch}"])
+        except Exception:  # noqa: BLE001
+            self._clone(branch)
+
     def _head_commit(self):
         """The commit actually checked out in repo_root right now."""
         try:
@@ -681,9 +710,16 @@ class GitWorker(QThread):
                         not (self.repo_root / ".git").exists():
                     self._clone(self.branch)
                 else:
-                    self._run(["git"] + self._auth_args() +
-                              ["-C", str(self.repo_root), "pull",
-                               "--ff-only"])
+                    # The configured metadata branch (or the app's own
+                    # `branch`) can change after the app was installed —
+                    # pulling whatever is checked out would keep tracking
+                    # the old branch forever.
+                    if self.branch and self._current_branch() != self.branch:
+                        self._switch_branch(self.branch)
+                    else:
+                        self._run(["git"] + self._auth_args() +
+                                  ["-C", str(self.repo_root), "pull",
+                                   "--ff-only"])
                 # Report the commit Git actually checked out, not the SHA
                 # the catalog scan saw before this ran — the branch may have
                 # advanced (or a release re-clone lands on a different

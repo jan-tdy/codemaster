@@ -162,6 +162,66 @@ def test_installed_apps_falls_back_when_not_in_catalog():
     assert apps[0]["name"] == "App"
 
 
+# -- GitWorker branch handling on update ---------------------------------------- #
+def _bare_worker(branch, current_branch):
+    """A GitWorker with its git calls recorded instead of executed.
+
+    Bypassing __init__ (and therefore QThread.__init__) keeps these tests
+    free of a Qt event loop; only the command building is under test.
+    """
+    worker = cm.GitWorker.__new__(cm.GitWorker)
+    worker.action = "update"
+    worker.username = "jan-tdy"
+    worker.repo = "app"
+    worker.repo_root = Path("/tmp/app")
+    worker.branch = branch
+    worker.method = "sync"
+    worker.release_tag = None
+    worker.token = ""
+    worker.commands = []
+
+    def fake_run(cmd, cwd=None):
+        worker.commands.append(cmd)
+        if "--abbrev-ref" in cmd:
+            return current_branch + "\n"
+        return ""
+
+    worker._run = fake_run
+    return worker
+
+
+def test_update_switches_to_the_configured_branch():
+    # The metadata branch can change after the app was installed; the
+    # clone is shallow, so the new branch has to be fetched before it
+    # can be checked out.
+    worker = _bare_worker(branch="beta", current_branch="main")
+    worker._switch_branch("beta")
+    fetch, checkout = worker.commands
+    assert fetch[-5:] == ["fetch", "--depth", "1", "origin",
+                          "+refs/heads/beta:refs/remotes/origin/beta"]
+    assert checkout[-4:] == ["checkout", "-B", "beta", "origin/beta"]
+
+
+def test_update_re_clones_when_the_branch_switch_fails():
+    worker = _bare_worker(branch="beta", current_branch="main")
+    cloned = []
+
+    def failing_run(cmd, cwd=None):
+        raise RuntimeError("your local changes would be overwritten")
+
+    worker._run = failing_run
+    worker._clone = cloned.append
+    worker._switch_branch("beta")
+    assert cloned == ["beta"]
+
+
+def test_current_branch_reads_the_checked_out_branch():
+    worker = _bare_worker(branch="beta", current_branch="main")
+    assert worker._current_branch() == "main"
+    assert worker.commands == [["git", "-C", "/tmp/app",
+                                "rev-parse", "--abbrev-ref", "HEAD"]]
+
+
 # -- CatalogLoader rate limit handling ---------------------------------------- #
 class _FakeResponse:
     def __init__(self, status_code, headers=None):
