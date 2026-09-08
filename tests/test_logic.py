@@ -162,6 +162,86 @@ def test_installed_apps_falls_back_when_not_in_catalog():
     assert apps[0]["name"] == "App"
 
 
+# -- GitWorker branch switching on update -------------------------------------- #
+def _bare_worker(branch="main", repo_root="/tmp/repo"):
+    worker = cm.GitWorker.__new__(cm.GitWorker)
+    worker.action = "update"
+    worker.username = "user"
+    worker.repo = "repo"
+    worker.repo_root = Path(repo_root)
+    worker.branch = branch
+    worker.req_path = None
+    worker.method = "sync"
+    worker.release_tag = None
+    worker.token = ""
+    return worker
+
+
+def test_current_branch_parses_rev_parse_output(monkeypatch):
+    worker = _bare_worker()
+    monkeypatch.setattr(worker, "_run", lambda cmd, cwd=None: "feature\n")
+    assert worker._current_branch() == "feature"
+
+
+def test_current_branch_blank_when_detached_head():
+    # A shallow clone left in a detached state (or a repo with no commits
+    # yet) reports "HEAD" from rev-parse, not a real branch name.
+    worker = _bare_worker()
+    worker._run = lambda cmd, cwd=None: "HEAD\n"
+    assert worker._current_branch() == ""
+
+
+def test_sync_update_pulls_when_already_on_configured_branch(monkeypatch):
+    worker = _bare_worker(branch="main")
+    monkeypatch.setattr(worker, "_current_branch", lambda: "main")
+    calls = []
+    monkeypatch.setattr(worker, "_run", lambda cmd, cwd=None: calls.append(cmd))
+    worker._sync_update()
+    assert len(calls) == 1
+    assert calls[0][-2:] == ["pull", "--ff-only"]
+
+
+def test_sync_update_switches_branch_when_configured_branch_changed(monkeypatch):
+    # Regression test for https://github.com/jan-tdy/codemaster/issues/15 —
+    # changing the Metadata branch setting (or an app's declared branch)
+    # after install must be picked up on the next update, not silently
+    # ignored by a plain pull on whatever is still checked out.
+    worker = _bare_worker(branch="dev")
+    monkeypatch.setattr(worker, "_current_branch", lambda: "main")
+    switched = []
+    monkeypatch.setattr(worker, "_switch_branch", lambda branch: switched.append(branch))
+    cloned = []
+    monkeypatch.setattr(worker, "_clone", lambda ref: cloned.append(ref))
+    worker._sync_update()
+    assert switched == ["dev"]
+    assert cloned == []
+
+
+def test_switch_branch_fetches_and_checks_out(monkeypatch):
+    worker = _bare_worker(repo_root="/tmp/repo")
+    calls = []
+    monkeypatch.setattr(worker, "_run", lambda cmd, cwd=None: calls.append(cmd))
+    worker._switch_branch("dev")
+    assert len(calls) == 2
+    fetch, checkout = calls
+    assert "fetch" in fetch and "--depth" in fetch
+    assert "+refs/heads/dev:refs/remotes/origin/dev" in fetch
+    assert checkout[-4:] == ["checkout", "-B", "dev", "origin/dev"]
+
+
+def test_sync_update_falls_back_to_clone_when_switch_fails(monkeypatch):
+    worker = _bare_worker(branch="dev")
+    monkeypatch.setattr(worker, "_current_branch", lambda: "main")
+
+    def _boom(branch):
+        raise RuntimeError("shallow history doesn't contain dev")
+    monkeypatch.setattr(worker, "_switch_branch", _boom)
+    cloned = []
+    monkeypatch.setattr(worker, "_clone", lambda ref: cloned.append(ref))
+    worker._sync_update()
+    assert cloned == ["dev"]
+
+
 # -- CatalogLoader rate limit handling ---------------------------------------- #
 class _FakeResponse:
     def __init__(self, status_code, headers=None):
