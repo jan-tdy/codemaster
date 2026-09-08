@@ -38,7 +38,8 @@ publishes the Telescope Cover, Astrofoto, Atacama (C14) and DSLR apps.
   repositories too, not just public ones. Private apps show a 🔒 badge in the
   Store. The token authenticates the catalog scan, the metadata/icon fetch
   and the `git clone`/`git pull` used to install and update — it's passed
-  per-command and never written into a cloned repo's `.git/config`.
+  through each Git process's environment and never exposed in its command
+  line or written into a cloned repo's `.git/config`.
 - **▶ Code Runner** — the small Python editor/runner from the classic Code
   Master, kept for quick snippets (runs asynchronously so it never freezes the
   UI).

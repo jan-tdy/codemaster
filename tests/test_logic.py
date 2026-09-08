@@ -1,3 +1,4 @@
+import subprocess
 import sys
 from pathlib import Path
 
@@ -200,6 +201,72 @@ def test_update_switches_to_the_configured_branch():
     assert fetch[-5:] == ["fetch", "--depth", "1", "origin",
                           "+refs/heads/beta:refs/remotes/origin/beta"]
     assert checkout[-4:] == ["checkout", "-B", "beta", "origin/beta"]
+
+
+def test_git_auth_token_is_passed_via_environment(monkeypatch):
+    monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
+    worker = cm.GitWorker.__new__(cm.GitWorker)
+    worker.token = "secret-token"
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cm.subprocess, "run", fake_run)
+    worker._run(["git", "fetch", "origin"])
+
+    cmd, kwargs = calls[0]
+    assert all("secret-token" not in arg for arg in cmd)
+    assert cmd == ["git", "fetch", "origin"]
+    assert kwargs["env"]["GIT_CONFIG_COUNT"] == "1"
+    assert kwargs["env"]["GIT_CONFIG_KEY_0"] == "http.extraheader"
+    assert kwargs["env"]["GIT_CONFIG_VALUE_0"].startswith(
+        "Authorization: Basic ")
+
+
+def test_clone_preserves_existing_repo_until_replacement_succeeds(tmp_path):
+    worker = _bare_worker(branch="beta", current_branch="main")
+    worker.repo_root = tmp_path / "app"
+    worker.repo_root.mkdir()
+    (worker.repo_root / "old").write_text("old", encoding="utf-8")
+
+    def successful_clone(cmd, cwd=None):
+        assert (worker.repo_root / "old").exists()
+        assert cmd[:-1] == [
+            "git", "clone", "--depth", "1", "--branch", "beta",
+            "https://github.com/jan-tdy/app.git",
+        ]
+        clone_root = Path(cmd[-1])
+        (clone_root / "new").write_text("new", encoding="utf-8")
+        return ""
+
+    worker._run = successful_clone
+    worker._clone("beta")
+
+    assert (worker.repo_root / "new").read_text(encoding="utf-8") == "new"
+    assert not (worker.repo_root / "old").exists()
+    assert list(tmp_path.iterdir()) == [worker.repo_root]
+
+
+def test_clone_failure_preserves_existing_repo_and_cleans_temp_dir(tmp_path):
+    worker = _bare_worker(branch="beta", current_branch="main")
+    worker.repo_root = tmp_path / "app"
+    worker.repo_root.mkdir()
+    (worker.repo_root / "old").write_text("old", encoding="utf-8")
+
+    def failing_clone(cmd, cwd=None):
+        raise RuntimeError("clone failed")
+
+    worker._run = failing_clone
+    try:
+        worker._clone("beta")
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert str(exc) == "clone failed"
+
+    assert (worker.repo_root / "old").read_text(encoding="utf-8") == "old"
+    assert list(tmp_path.iterdir()) == [worker.repo_root]
 
 
 def test_update_re_clones_when_the_branch_switch_fails():
