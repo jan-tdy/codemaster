@@ -192,6 +192,7 @@ def _bare_worker(branch, current_branch):
 
 
 def test_update_switches_to_the_configured_branch():
+    """Updating to another configured branch fetches and checks it out."""
     # The metadata branch can change after the app was installed; the
     # clone is shallow, so the new branch has to be fetched before it
     # can be checked out.
@@ -204,6 +205,7 @@ def test_update_switches_to_the_configured_branch():
 
 
 def test_git_auth_token_is_passed_via_environment(monkeypatch):
+    """Git authentication keeps the token out of command-line arguments."""
     monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
     worker = cm.GitWorker.__new__(cm.GitWorker)
     worker.token = "secret-token"
@@ -226,6 +228,7 @@ def test_git_auth_token_is_passed_via_environment(monkeypatch):
 
 
 def test_clone_preserves_existing_repo_until_replacement_succeeds(tmp_path):
+    """A successful clone replaces the existing repository atomically."""
     worker = _bare_worker(branch="beta", current_branch="main")
     worker.repo_root = tmp_path / "app"
     worker.repo_root.mkdir()
@@ -250,6 +253,7 @@ def test_clone_preserves_existing_repo_until_replacement_succeeds(tmp_path):
 
 
 def test_clone_failure_preserves_existing_repo_and_cleans_temp_dir(tmp_path):
+    """A failed clone preserves the repository and removes temporary data."""
     worker = _bare_worker(branch="beta", current_branch="main")
     worker.repo_root = tmp_path / "app"
     worker.repo_root.mkdir()
@@ -270,6 +274,7 @@ def test_clone_failure_preserves_existing_repo_and_cleans_temp_dir(tmp_path):
 
 
 def test_update_re_clones_when_the_branch_switch_fails():
+    """A failed branch switch falls back to cloning the requested branch."""
     worker = _bare_worker(branch="beta", current_branch="main")
     cloned = []
 
@@ -283,6 +288,7 @@ def test_update_re_clones_when_the_branch_switch_fails():
 
 
 def test_current_branch_reads_the_checked_out_branch():
+    """The current branch is read from the worker's repository checkout."""
     worker = _bare_worker(branch="beta", current_branch="main")
     assert worker._current_branch() == "main"
     assert worker.commands == [["git", "-C", "/tmp/app",

@@ -561,6 +561,7 @@ class GitWorker(QThread):
         self.token = token
 
     def _run(self, cmd, cwd=None):
+        """Run a command, raising an error when it exits unsuccessfully."""
         env = self._auth_env() if cmd and cmd[0] == "git" else None
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
                               env=env)
