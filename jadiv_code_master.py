@@ -590,6 +590,31 @@ class GitWorker(QThread):
         cmd += [url, str(self.repo_root)]
         self._run(cmd)
 
+    def _current_branch(self):
+        """The branch currently checked out in repo_root, or '' if unknown."""
+        try:
+            ref = self._run(
+                ["git", "-C", str(self.repo_root), "rev-parse",
+                 "--abbrev-ref", "HEAD"]
+            ).strip()
+            return "" if ref == "HEAD" else ref
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _switch_branch(self, branch):
+        """Point the shallow clone at a different branch.
+
+        Clones are made with --depth 1, so the target branch's history
+        isn't present locally yet — fetch it explicitly before checking
+        it out.
+        """
+        self._run(["git"] + self._auth_args() +
+                   ["-C", str(self.repo_root), "fetch", "--depth", "1",
+                    "origin",
+                    f"+refs/heads/{branch}:refs/remotes/origin/{branch}"])
+        self._run(["git", "-C", str(self.repo_root), "checkout", "-B",
+                    branch, f"origin/{branch}"])
+
     def _head_commit(self):
         """The commit actually checked out in repo_root right now."""
         try:
@@ -661,6 +686,26 @@ class GitWorker(QThread):
                 f"Install manually with:\n    sudo apt install {packages}"
             ) from exc
 
+    def _sync_update(self):
+        """Update an already-cloned sync app in place.
+
+        Reconciles the clone with ``self.branch`` (the configured metadata
+        branch, or the app's own declared branch) before pulling — a plain
+        pull would otherwise keep tracking whatever happens to be checked
+        out, silently ignoring a branch change made after install.
+        """
+        if self.branch and self._current_branch() != self.branch:
+            try:
+                self._switch_branch(self.branch)
+            except Exception:  # noqa: BLE001
+                # Local state conflicts with the checkout, or the shallow
+                # history doesn't contain the new branch — fall back to the
+                # same fresh-clone path a release update already uses.
+                self._clone(self.branch)
+        else:
+            self._run(["git"] + self._auth_args() +
+                       ["-C", str(self.repo_root), "pull", "--ff-only"])
+
     def run(self):
         """
         Execute the requested repository operation and emit its result.
@@ -681,9 +726,7 @@ class GitWorker(QThread):
                         not (self.repo_root / ".git").exists():
                     self._clone(self.branch)
                 else:
-                    self._run(["git"] + self._auth_args() +
-                              ["-C", str(self.repo_root), "pull",
-                               "--ff-only"])
+                    self._sync_update()
                 # Report the commit Git actually checked out, not the SHA
                 # the catalog scan saw before this ran — the branch may have
                 # advanced (or a release re-clone lands on a different
