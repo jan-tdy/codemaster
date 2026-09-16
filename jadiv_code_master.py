@@ -629,10 +629,11 @@ class GitWorker(QThread):
     def _current_branch(self):
         """The branch checked out in repo_root, or "" when detached/unknown."""
         try:
-            return self._run(
+            ref = self._run(
                 ["git", "-C", str(self.repo_root),
                  "rev-parse", "--abbrev-ref", "HEAD"]
             ).strip()
+            return "" if ref == "HEAD" else ref
         except Exception:  # noqa: BLE001
             return ""
 
@@ -726,6 +727,19 @@ class GitWorker(QThread):
                 f"Install manually with:\n    sudo apt install {packages}"
             ) from exc
 
+    def _sync_update(self):
+        """Update an already-cloned sync app in place.
+
+        Reconciles the clone with ``self.branch`` (the configured metadata
+        branch, or the app's own declared branch) before pulling — a plain
+        pull would otherwise keep tracking whatever happens to be checked
+        out, silently ignoring a branch change made after install.
+        """
+        if self.branch and self._current_branch() != self.branch:
+            self._switch_branch(self.branch)
+        else:
+            self._run(["git", "-C", str(self.repo_root), "pull", "--ff-only"])
+
     def run(self):
         """
         Execute the requested repository operation and emit its result.
@@ -746,15 +760,7 @@ class GitWorker(QThread):
                         not (self.repo_root / ".git").exists():
                     self._clone(self.branch)
                 else:
-                    # The configured metadata branch (or the app's own
-                    # `branch`) can change after the app was installed —
-                    # pulling whatever is checked out would keep tracking
-                    # the old branch forever.
-                    if self.branch and self._current_branch() != self.branch:
-                        self._switch_branch(self.branch)
-                    else:
-                        self._run(["git", "-C", str(self.repo_root), "pull",
-                                   "--ff-only"])
+                    self._sync_update()
                 # Report the commit Git actually checked out, not the SHA
                 # the catalog scan saw before this ran — the branch may have
                 # advanced (or a release re-clone lands on a different

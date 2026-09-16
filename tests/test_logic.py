@@ -164,7 +164,7 @@ def test_installed_apps_falls_back_when_not_in_catalog():
 
 
 # -- GitWorker branch handling on update ---------------------------------------- #
-def _bare_worker(branch, current_branch):
+def _bare_worker(branch="main", current_branch="main", repo_root="/tmp/app"):
     """A GitWorker with its git calls recorded instead of executed.
 
     Bypassing __init__ (and therefore QThread.__init__) keeps these tests
@@ -174,8 +174,9 @@ def _bare_worker(branch, current_branch):
     worker.action = "update"
     worker.username = "jan-tdy"
     worker.repo = "app"
-    worker.repo_root = Path("/tmp/app")
+    worker.repo_root = Path(repo_root)
     worker.branch = branch
+    worker.req_path = None
     worker.method = "sync"
     worker.release_tag = None
     worker.token = ""
@@ -293,6 +294,46 @@ def test_current_branch_reads_the_checked_out_branch():
     assert worker._current_branch() == "main"
     assert worker.commands == [["git", "-C", "/tmp/app",
                                 "rev-parse", "--abbrev-ref", "HEAD"]]
+
+
+def test_current_branch_parses_rev_parse_output(monkeypatch):
+    worker = _bare_worker()
+    monkeypatch.setattr(worker, "_run", lambda cmd, cwd=None: "feature\n")
+    assert worker._current_branch() == "feature"
+
+
+def test_current_branch_blank_when_detached_head():
+    # A shallow clone left in a detached state (or a repo with no commits
+    # yet) reports "HEAD" from rev-parse, not a real branch name.
+    worker = _bare_worker()
+    worker._run = lambda cmd, cwd=None: "HEAD\n"
+    assert worker._current_branch() == ""
+
+
+def test_sync_update_pulls_when_already_on_configured_branch(monkeypatch):
+    worker = _bare_worker(branch="main")
+    monkeypatch.setattr(worker, "_current_branch", lambda: "main")
+    calls = []
+    monkeypatch.setattr(worker, "_run", lambda cmd, cwd=None: calls.append(cmd))
+    worker._sync_update()
+    assert len(calls) == 1
+    assert calls[0][-2:] == ["pull", "--ff-only"]
+
+
+def test_sync_update_switches_branch_when_configured_branch_changed(monkeypatch):
+    # Regression test for https://github.com/jan-tdy/codemaster/issues/15 —
+    # changing the Metadata branch setting (or an app's declared branch)
+    # after install must be picked up on the next update, not silently
+    # ignored by a plain pull on whatever is still checked out.
+    worker = _bare_worker(branch="dev")
+    monkeypatch.setattr(worker, "_current_branch", lambda: "main")
+    switched = []
+    monkeypatch.setattr(worker, "_switch_branch", lambda branch: switched.append(branch))
+    cloned = []
+    monkeypatch.setattr(worker, "_clone", lambda ref: cloned.append(ref))
+    worker._sync_update()
+    assert switched == ["dev"]
+    assert cloned == []
 
 
 # -- CatalogLoader rate limit handling ---------------------------------------- #
