@@ -1,3 +1,4 @@
+import subprocess
 import sys
 from pathlib import Path
 
@@ -162,19 +163,137 @@ def test_installed_apps_falls_back_when_not_in_catalog():
     assert apps[0]["name"] == "App"
 
 
-# -- GitWorker branch switching on update -------------------------------------- #
-def _bare_worker(branch="main", repo_root="/tmp/repo"):
+# -- GitWorker branch handling on update ---------------------------------------- #
+def _bare_worker(branch="main", current_branch="main", repo_root="/tmp/app"):
+    """A GitWorker with its git calls recorded instead of executed.
+
+    Bypassing __init__ (and therefore QThread.__init__) keeps these tests
+    free of a Qt event loop; only the command building is under test.
+    """
     worker = cm.GitWorker.__new__(cm.GitWorker)
     worker.action = "update"
-    worker.username = "user"
-    worker.repo = "repo"
+    worker.username = "jan-tdy"
+    worker.repo = "app"
     worker.repo_root = Path(repo_root)
     worker.branch = branch
     worker.req_path = None
     worker.method = "sync"
     worker.release_tag = None
     worker.token = ""
+    worker.commands = []
+
+    def fake_run(cmd, cwd=None):
+        worker.commands.append(cmd)
+        if "--abbrev-ref" in cmd:
+            return current_branch + "\n"
+        return ""
+
+    worker._run = fake_run
     return worker
+
+
+def test_update_switches_to_the_configured_branch():
+    """Updating to another configured branch fetches and checks it out."""
+    # The metadata branch can change after the app was installed; the
+    # clone is shallow, so the new branch has to be fetched before it
+    # can be checked out.
+    worker = _bare_worker(branch="beta", current_branch="main")
+    worker._switch_branch("beta")
+    fetch, checkout = worker.commands
+    assert fetch[-5:] == ["fetch", "--depth", "1", "origin",
+                          "+refs/heads/beta:refs/remotes/origin/beta"]
+    assert checkout[-4:] == ["checkout", "-B", "beta", "origin/beta"]
+
+
+def test_git_auth_token_is_passed_via_environment(monkeypatch):
+    """Git authentication keeps the token out of command-line arguments."""
+    monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
+    worker = cm.GitWorker.__new__(cm.GitWorker)
+    worker.token = "secret-token"
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cm.subprocess, "run", fake_run)
+    worker._run(["git", "fetch", "origin"])
+
+    cmd, kwargs = calls[0]
+    assert all("secret-token" not in arg for arg in cmd)
+    assert cmd == ["git", "fetch", "origin"]
+    assert kwargs["env"]["GIT_CONFIG_COUNT"] == "1"
+    assert kwargs["env"]["GIT_CONFIG_KEY_0"] == "http.extraheader"
+    assert kwargs["env"]["GIT_CONFIG_VALUE_0"].startswith(
+        "Authorization: Basic ")
+
+
+def test_clone_preserves_existing_repo_until_replacement_succeeds(tmp_path):
+    """A successful clone replaces the existing repository atomically."""
+    worker = _bare_worker(branch="beta", current_branch="main")
+    worker.repo_root = tmp_path / "app"
+    worker.repo_root.mkdir()
+    (worker.repo_root / "old").write_text("old", encoding="utf-8")
+
+    def successful_clone(cmd, cwd=None):
+        assert (worker.repo_root / "old").exists()
+        assert cmd[:-1] == [
+            "git", "clone", "--depth", "1", "--branch", "beta",
+            "https://github.com/jan-tdy/app.git",
+        ]
+        clone_root = Path(cmd[-1])
+        (clone_root / "new").write_text("new", encoding="utf-8")
+        return ""
+
+    worker._run = successful_clone
+    worker._clone("beta")
+
+    assert (worker.repo_root / "new").read_text(encoding="utf-8") == "new"
+    assert not (worker.repo_root / "old").exists()
+    assert list(tmp_path.iterdir()) == [worker.repo_root]
+
+
+def test_clone_failure_preserves_existing_repo_and_cleans_temp_dir(tmp_path):
+    """A failed clone preserves the repository and removes temporary data."""
+    worker = _bare_worker(branch="beta", current_branch="main")
+    worker.repo_root = tmp_path / "app"
+    worker.repo_root.mkdir()
+    (worker.repo_root / "old").write_text("old", encoding="utf-8")
+
+    def failing_clone(cmd, cwd=None):
+        raise RuntimeError("clone failed")
+
+    worker._run = failing_clone
+    try:
+        worker._clone("beta")
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert str(exc) == "clone failed"
+
+    assert (worker.repo_root / "old").read_text(encoding="utf-8") == "old"
+    assert list(tmp_path.iterdir()) == [worker.repo_root]
+
+
+def test_update_re_clones_when_the_branch_switch_fails():
+    """A failed branch switch falls back to cloning the requested branch."""
+    worker = _bare_worker(branch="beta", current_branch="main")
+    cloned = []
+
+    def failing_run(cmd, cwd=None):
+        raise RuntimeError("your local changes would be overwritten")
+
+    worker._run = failing_run
+    worker._clone = cloned.append
+    worker._switch_branch("beta")
+    assert cloned == ["beta"]
+
+
+def test_current_branch_reads_the_checked_out_branch():
+    """The current branch is read from the worker's repository checkout."""
+    worker = _bare_worker(branch="beta", current_branch="main")
+    assert worker._current_branch() == "main"
+    assert worker.commands == [["git", "-C", "/tmp/app",
+                                "rev-parse", "--abbrev-ref", "HEAD"]]
 
 
 def test_current_branch_parses_rev_parse_output(monkeypatch):
@@ -215,31 +334,6 @@ def test_sync_update_switches_branch_when_configured_branch_changed(monkeypatch)
     worker._sync_update()
     assert switched == ["dev"]
     assert cloned == []
-
-
-def test_switch_branch_fetches_and_checks_out(monkeypatch):
-    worker = _bare_worker(repo_root="/tmp/repo")
-    calls = []
-    monkeypatch.setattr(worker, "_run", lambda cmd, cwd=None: calls.append(cmd))
-    worker._switch_branch("dev")
-    assert len(calls) == 2
-    fetch, checkout = calls
-    assert "fetch" in fetch and "--depth" in fetch
-    assert "+refs/heads/dev:refs/remotes/origin/dev" in fetch
-    assert checkout[-4:] == ["checkout", "-B", "dev", "origin/dev"]
-
-
-def test_sync_update_falls_back_to_clone_when_switch_fails(monkeypatch):
-    worker = _bare_worker(branch="dev")
-    monkeypatch.setattr(worker, "_current_branch", lambda: "main")
-
-    def _boom(branch):
-        raise RuntimeError("shallow history doesn't contain dev")
-    monkeypatch.setattr(worker, "_switch_branch", _boom)
-    cloned = []
-    monkeypatch.setattr(worker, "_clone", lambda ref: cloned.append(ref))
-    worker._sync_update()
-    assert cloned == ["dev"]
 
 
 # -- CatalogLoader rate limit handling ---------------------------------------- #

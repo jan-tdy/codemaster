@@ -561,59 +561,100 @@ class GitWorker(QThread):
         self.token = token
 
     def _run(self, cmd, cwd=None):
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+        """Run a command, raising an error when it exits unsuccessfully."""
+        env = self._auth_env() if cmd and cmd[0] == "git" else None
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                              env=env)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
         return proc.stdout
 
-    def _auth_args(self):
+    def _auth_env(self):
         """Per-invocation git auth for private repos.
 
-        Passed via ``-c http.extraheader`` rather than embedding the token
-        in the remote URL, so it is never written into the clone's
-        ``.git/config`` on disk."""
+        Pass the authorization header through Git's environment-backed
+        configuration so the token is absent from both the command line and
+        the clone's ``.git/config`` on disk.
+        """
         if not self.token:
-            return []
+            return None
         basic = base64.b64encode(
             f"x-access-token:{self.token}".encode("utf-8")).decode("ascii")
-        return ["-c", f"http.extraheader=Authorization: Basic {basic}"]
+        env = os.environ.copy()
+        try:
+            config_count = max(0, int(env.get("GIT_CONFIG_COUNT", "0")))
+        except ValueError:
+            config_count = 0
+        env[f"GIT_CONFIG_KEY_{config_count}"] = "http.extraheader"
+        env[f"GIT_CONFIG_VALUE_{config_count}"] = \
+            f"Authorization: Basic {basic}"
+        env["GIT_CONFIG_COUNT"] = str(config_count + 1)
+        return env
 
     def _clone(self, ref):
         """Fresh shallow clone of the repo at a branch or tag."""
         url = f"https://github.com/{self.username}/{self.repo}.git"
-        if self.repo_root.exists():
-            shutil.rmtree(self.repo_root)
         self.repo_root.parent.mkdir(parents=True, exist_ok=True)
-        cmd = ["git"] + self._auth_args() + ["clone", "--depth", "1"]
+        clone_root = Path(tempfile.mkdtemp(
+            prefix=f".{self.repo_root.name}-clone-",
+            dir=self.repo_root.parent,
+        ))
+        cmd = ["git", "clone", "--depth", "1"]
         if ref:
             cmd += ["--branch", ref]
-        cmd += [url, str(self.repo_root)]
-        self._run(cmd)
+        cmd += [url, str(clone_root)]
+
+        backup_root = clone_root.with_name(f"{clone_root.name}-old")
+        try:
+            self._run(cmd)
+            had_existing_repo = self.repo_root.exists() or \
+                self.repo_root.is_symlink()
+            if had_existing_repo:
+                self.repo_root.replace(backup_root)
+            try:
+                clone_root.replace(self.repo_root)
+            except Exception:
+                if had_existing_repo and backup_root.exists():
+                    backup_root.replace(self.repo_root)
+                raise
+            if had_existing_repo:
+                if backup_root.is_dir() and not backup_root.is_symlink():
+                    shutil.rmtree(backup_root, ignore_errors=True)
+                else:
+                    backup_root.unlink(missing_ok=True)
+        finally:
+            if clone_root.exists():
+                shutil.rmtree(clone_root, ignore_errors=True)
 
     def _current_branch(self):
-        """The branch currently checked out in repo_root, or '' if unknown."""
+        """The branch checked out in repo_root, or "" when detached/unknown."""
         try:
             ref = self._run(
-                ["git", "-C", str(self.repo_root), "rev-parse",
-                 "--abbrev-ref", "HEAD"]
+                ["git", "-C", str(self.repo_root),
+                 "rev-parse", "--abbrev-ref", "HEAD"]
             ).strip()
             return "" if ref == "HEAD" else ref
         except Exception:  # noqa: BLE001
             return ""
 
     def _switch_branch(self, branch):
-        """Point the shallow clone at a different branch.
+        """Move an existing clone onto ``branch``.
 
-        Clones are made with --depth 1, so the target branch's history
-        isn't present locally yet — fetch it explicitly before checking
-        it out.
+        Clones are shallow (``--depth 1 --branch <branch>``), so the other
+        branches aren't in the clone at all and a plain checkout fails —
+        the branch has to be fetched first. If the switch fails anyway
+        (local state in the way, history too shallow to connect), fall
+        back to a fresh clone at the requested branch.
         """
-        self._run(["git"] + self._auth_args() +
-                   ["-C", str(self.repo_root), "fetch", "--depth", "1",
-                    "origin",
-                    f"+refs/heads/{branch}:refs/remotes/origin/{branch}"])
-        self._run(["git", "-C", str(self.repo_root), "checkout", "-B",
-                    branch, f"origin/{branch}"])
+        try:
+            self._run(["git", "-C", str(self.repo_root),
+                       "fetch", "--depth", "1",
+                       "origin",
+                       f"+refs/heads/{branch}:refs/remotes/origin/{branch}"])
+            self._run(["git", "-C", str(self.repo_root), "checkout",
+                       "-B", branch, f"origin/{branch}"])
+        except Exception:  # noqa: BLE001
+            self._clone(branch)
 
     def _head_commit(self):
         """The commit actually checked out in repo_root right now."""
@@ -695,16 +736,9 @@ class GitWorker(QThread):
         out, silently ignoring a branch change made after install.
         """
         if self.branch and self._current_branch() != self.branch:
-            try:
-                self._switch_branch(self.branch)
-            except Exception:  # noqa: BLE001
-                # Local state conflicts with the checkout, or the shallow
-                # history doesn't contain the new branch — fall back to the
-                # same fresh-clone path a release update already uses.
-                self._clone(self.branch)
+            self._switch_branch(self.branch)
         else:
-            self._run(["git"] + self._auth_args() +
-                       ["-C", str(self.repo_root), "pull", "--ff-only"])
+            self._run(["git", "-C", str(self.repo_root), "pull", "--ff-only"])
 
     def run(self):
         """
