@@ -306,11 +306,82 @@ def test_git_auth_token_is_passed_via_environment(monkeypatch):
 
     cmd, kwargs = calls[0]
     assert all("secret-token" not in arg for arg in cmd)
-    assert cmd == ["git", "fetch", "origin"]
+    assert cmd == ["git", "-c", "credential.helper=", "fetch", "origin"]
     assert kwargs["env"]["GIT_CONFIG_COUNT"] == "1"
     assert kwargs["env"]["GIT_CONFIG_KEY_0"] == "http.extraheader"
     assert kwargs["env"]["GIT_CONFIG_VALUE_0"].startswith(
         "Authorization: Basic ")
+
+
+# -- GitWorker._run credential-prompt / hang safeguards --------------------------- #
+def test_run_disables_git_terminal_prompts_and_stdin(monkeypatch):
+    # Regression test for https://github.com/jan-tdy/codemaster/issues/17 —
+    # a git command must never be able to block on an interactive
+    # credential prompt: no inherited stdin, terminal prompts disabled, and
+    # any configured credential helper (which might prompt via its own GUI,
+    # bypassing GIT_TERMINAL_PROMPT) turned off.
+    monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
+    worker = cm.GitWorker.__new__(cm.GitWorker)
+    worker.token = ""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cm.subprocess, "run", fake_run)
+    worker._run(["git", "fetch", "origin"])
+
+    cmd, kwargs = calls[0]
+    assert kwargs["stdin"] == subprocess.DEVNULL
+    assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert cmd == ["git", "-c", "credential.helper=", "fetch", "origin"]
+
+
+def test_run_applies_a_default_timeout_to_git_commands(monkeypatch):
+    worker = cm.GitWorker.__new__(cm.GitWorker)
+    worker.token = ""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cm.subprocess, "run", fake_run)
+    worker._run(["git", "fetch", "origin"])
+    assert calls[0][1]["timeout"] == cm.GIT_TIMEOUT_SECONDS
+
+
+def test_run_does_not_apply_a_default_timeout_to_non_git_commands(monkeypatch):
+    # pip/apt installs can legitimately run far longer than a git network
+    # op is ever allowed to; only git commands get the default timeout.
+    worker = cm.GitWorker.__new__(cm.GitWorker)
+    worker.token = ""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cm.subprocess, "run", fake_run)
+    worker._run(["pip", "install", "requests"])
+    assert calls[0][1]["timeout"] is None
+    assert calls[0][1]["stdin"] == subprocess.DEVNULL
+
+
+def test_run_converts_a_timeout_into_a_runtime_error(monkeypatch):
+    worker = cm.GitWorker.__new__(cm.GitWorker)
+    worker.token = ""
+
+    def fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    monkeypatch.setattr(cm.subprocess, "run", fake_run)
+    try:
+        worker._run(["git", "fetch", "origin"])
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert "Timed out" in str(exc)
 
 
 def test_clone_preserves_existing_repo_until_replacement_succeeds(tmp_path):
