@@ -114,6 +114,10 @@ APP_VERSION = "0.3.1"
 DEFAULT_USERNAME = "jan-tdy"
 DEFAULT_BRANCH = "main"
 METADATA_FILE = "codemaster-metadata.json"
+# Ceiling for a single git network operation (clone/fetch/pull), so a dead
+# or stalled connection surfaces as an error instead of hanging the
+# background worker thread forever.
+GIT_TIMEOUT_SECONDS = 120
 
 CONFIG_DIR = Path.home() / ".config" / "codemaster"
 DATA_DIR = Path.home() / ".local" / "share" / "codemaster"
@@ -560,11 +564,33 @@ class GitWorker(QThread):
         self.release_tag = release_tag
         self.token = token
 
-    def _run(self, cmd, cwd=None):
-        """Run a command, raising an error when it exits unsuccessfully."""
-        env = self._auth_env() if cmd and cmd[0] == "git" else None
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                              env=env)
+    def _run(self, cmd, cwd=None, timeout=None):
+        """Run a command, raising an error when it exits unsuccessfully.
+
+        stdin is always closed and, for git, terminal credential prompts and
+        credential helpers are disabled — otherwise an auth challenge (a
+        repo that went private, a stored token that expired or was
+        revoked) leaves git blocked waiting for input that will never
+        come, hanging this background thread with no feedback to the
+        user. A timeout guards the same failure mode for a stalled or
+        dead network connection.
+        """
+        is_git = bool(cmd) and cmd[0] == "git"
+        env = self._auth_env() if is_git else None
+        if is_git:
+            env = env or os.environ.copy()
+            env["GIT_TERMINAL_PROMPT"] = "0"
+            cmd = [cmd[0], "-c", "credential.helper="] + cmd[1:]
+            if timeout is None:
+                timeout = GIT_TIMEOUT_SECONDS
+        try:
+            proc = subprocess.run(cmd, cwd=cwd, capture_output=True,
+                                  text=True, env=env,
+                                  stdin=subprocess.DEVNULL, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Timed out after {timeout}s waiting for: {' '.join(cmd)}"
+            ) from exc
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
         return proc.stdout
