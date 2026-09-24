@@ -110,7 +110,7 @@ except ImportError as exc:
     _report_missing_dependency(exc)
     sys.exit(1)
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 DEFAULT_USERNAME = "jan-tdy"
 DEFAULT_BRANCH = "main"
 METADATA_FILE = "codemaster-metadata.json"
@@ -1681,9 +1681,14 @@ class CodeMaster(QMainWindow):
 
     # -- self update ------------------------------------------------------ #
     def _self_catalog_entry(self):
-        """Code Master's own entry in the catalog, if one was fetched."""
-        return next((a for a in self.catalog if a["repo"] == "codemaster"),
-                    None)
+        """Code Master's own entry in the catalog, if one was fetched.
+
+        Matched by repo *and* app id: the codemaster repo could in
+        principle publish more than one app, so the first repo=="codemaster"
+        entry isn't necessarily Code Master itself.
+        """
+        return next((a for a in self.catalog if a["repo"] == "codemaster"
+                    and a.get("id") == "codemaster"), None)
 
     def _self_head_commit(self):
         """The commit Code Master itself is actually running from.
@@ -1716,6 +1721,10 @@ class CodeMaster(QMainWindow):
             return False, ""
         if entry.get("update_method", "sync") == "release":
             latest = self.effective_version(entry)
+            if not latest:
+                return False, ""
+            if latest.startswith("v"):
+                latest = latest[1:]
             if not latest or latest == APP_VERSION:
                 return False, ""
             return True, f"v{latest} (you have v{APP_VERSION})"
@@ -1752,8 +1761,10 @@ class CodeMaster(QMainWindow):
                 "Code Master isn't running from a git checkout, so it can't "
                 f"update itself automatically.\n\nLocation:\n{SELF_DIR}")
             return
+        entry = self._self_catalog_entry()
+        branch = entry.get("branch") if entry else None
         worker = GitWorker("update", self.config["username"], "codemaster",
-                           SELF_DIR, None, token=self.config["token"])
+                           SELF_DIR, branch, token=self.config["token"])
         self.self_update_btn.setEnabled(False)
         self.self_update_btn.setText("Updating…")
 
