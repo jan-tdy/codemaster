@@ -918,6 +918,7 @@ class CodeMaster(QMainWindow):
         # the background right after the window is up.
         self.catalog = load_catalog_cache()
         self._workers = set()
+        self._self_commit = None
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -1679,17 +1680,55 @@ class CodeMaster(QMainWindow):
         self.load_catalog()
 
     # -- self update ------------------------------------------------------ #
-    def _self_catalog_version(self):
-        """Latest published version of Code Master itself, from the catalog."""
-        entry = next((a for a in self.catalog if a["repo"] == "codemaster"),
-                     None)
-        return self.effective_version(entry) if entry else ""
+    def _self_catalog_entry(self):
+        """Code Master's own entry in the catalog, if one was fetched."""
+        return next((a for a in self.catalog if a["repo"] == "codemaster"),
+                    None)
+
+    def _self_head_commit(self):
+        """The commit Code Master itself is actually running from.
+
+        Cached after the first lookup since it can't change without a
+        restart.
+        """
+        if getattr(self, "_self_commit", None) is None:
+            try:
+                proc = subprocess.run(
+                    ["git", "-C", str(SELF_DIR), "rev-parse", "HEAD"],
+                    capture_output=True, text=True)
+                self._self_commit = (
+                    proc.stdout.strip() if proc.returncode == 0 else "")
+            except OSError:
+                self._self_commit = ""
+        return self._self_commit
+
+    def _self_update_status(self):
+        """(has_update, detail) for Code Master's own catalog entry.
+
+        Mirrors has_update(): a 'sync' entry (codemaster's normal case) is
+        compared by commit SHA rather than the metadata version string,
+        since a publisher can forget to bump it on every commit — see
+        https://github.com/jan-tdy/codemaster/issues/9. A 'release' entry
+        falls back to the version-string comparison.
+        """
+        entry = self._self_catalog_entry()
+        if not entry:
+            return False, ""
+        if entry.get("update_method", "sync") == "release":
+            latest = self.effective_version(entry)
+            if not latest or latest == APP_VERSION:
+                return False, ""
+            return True, f"v{latest} (you have v{APP_VERSION})"
+        latest_commit = entry.get("latest_commit")
+        current = self._self_head_commit()
+        if not latest_commit or not current or latest_commit == current:
+            return False, ""
+        return True, f"commit {latest_commit[:7]} (you have {current[:7]})"
 
     def _refresh_self_update_note(self):
         if not hasattr(self, "self_update_note"):
             return
         is_git = (SELF_DIR / ".git").exists()
-        latest = self._self_catalog_version()
         if not is_git:
             self.self_update_note.setText(
                 f"Running from {SELF_DIR} (not a git checkout). Re-clone or "
@@ -1697,10 +1736,11 @@ class CodeMaster(QMainWindow):
             self.self_update_btn.setEnabled(False)
             return
         self.self_update_btn.setEnabled(True)
-        if latest and latest != APP_VERSION:
+        has_update, detail = self._self_update_status()
+        if has_update:
             self.self_update_note.setText(
-                f"Update available: v{latest} (you have v{APP_VERSION}). "
-                "Updates Code Master in place via git; restart to apply.")
+                f"Update available: {detail}. Updates Code Master in place "
+                "via git; restart to apply.")
         else:
             self.self_update_note.setText(
                 "Pulls the latest Code Master from git; restart to apply.")

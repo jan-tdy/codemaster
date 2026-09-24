@@ -136,6 +136,63 @@ def test_has_update_returns_false_when_not_in_catalog():
     assert store.has_update({"key": "repo/app"}) is False
 
 
+# -- _self_update_status --------------------------------------------------------- #
+def test_self_update_status_sync_compares_commit_not_version():
+    # Regression test for https://github.com/jan-tdy/codemaster/issues/16 —
+    # codemaster's own catalog entry is a 'sync' app, so a commit-only fix
+    # must still be flagged even when `version` in the metadata is unchanged.
+    store = _bare_store()
+    store._self_commit = "aaa111"
+    store.catalog = [{"repo": "codemaster", "update_method": "sync",
+                      "version": cm.APP_VERSION, "latest_commit": "bbb222"}]
+    has_update, detail = store._self_update_status()
+    assert has_update is True
+    assert "bbb222"[:7] in detail
+
+
+def test_self_update_status_sync_same_commit_is_up_to_date():
+    store = _bare_store()
+    store._self_commit = "aaa111"
+    store.catalog = [{"repo": "codemaster", "update_method": "sync",
+                      "version": cm.APP_VERSION, "latest_commit": "aaa111"}]
+    assert store._self_update_status() == (False, "")
+
+
+def test_self_update_status_release_compares_version_string():
+    store = _bare_store()
+    store._self_commit = "aaa111"
+    store.catalog = [{"repo": "codemaster", "update_method": "release",
+                      "release_tag": "9.9.9", "version": cm.APP_VERSION}]
+    has_update, detail = store._self_update_status()
+    assert has_update is True
+    assert "9.9.9" in detail
+
+
+def test_self_update_status_release_same_version_is_up_to_date():
+    store = _bare_store()
+    store._self_commit = "aaa111"
+    store.catalog = [{"repo": "codemaster", "update_method": "release",
+                      "release_tag": cm.APP_VERSION, "version": "0.0.0"}]
+    assert store._self_update_status() == (False, "")
+
+
+def test_self_update_status_returns_false_when_not_in_catalog():
+    store = _bare_store()
+    store._self_commit = "aaa111"
+    store.catalog = []
+    assert store._self_update_status() == (False, "")
+
+
+def test_self_update_status_returns_false_without_own_commit():
+    # If Code Master's own HEAD commit can't be resolved, don't claim an
+    # update against an empty string.
+    store = _bare_store()
+    store._self_commit = ""
+    store.catalog = [{"repo": "codemaster", "update_method": "sync",
+                      "version": cm.APP_VERSION, "latest_commit": "bbb222"}]
+    assert store._self_update_status() == (False, "")
+
+
 # -- _installed_apps ------------------------------------------------------------ #
 def test_installed_apps_merges_catalog_over_stored_record():
     store = _bare_store()
