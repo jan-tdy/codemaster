@@ -156,6 +156,7 @@ file in its **root**. One repo, one metadata file, any number of apps:
 | `apps[].requirements` | no | Requirements file, relative to `subdir`. |
 | `apps[].update_method` | no | How the app updates — see below. Default `sync`. |
 | `apps[].maintained` | no | `false` shows an *unmaintained* badge. |
+| `apps[].mime_types` | no | List of MIME types (e.g. `["image/png", "image/jpeg"]`) the app can open. When set, **Add to menu** also writes a `MimeType=` line into the generated `.desktop` file, forwards the opened file(s) to `run` via `%F`, and registers the launcher as the default handler for each type with `xdg-mime`. |
 
 ### `update_method`
 

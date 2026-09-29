@@ -531,6 +531,7 @@ class CatalogLoader(QThread):
                         "entrypoint": app.get("entrypoint", ""),
                         "run": app.get("run", ""),
                         "requirements": app.get("requirements"),
+                        "mime_types": app.get("mime_types") or [],
                         "maintained": app.get("maintained", True),
                         "update_method": method,
                         "release_tag": release_tag if method == "release"
@@ -811,14 +812,21 @@ def _desktop_exec_quote(s):
              .replace("$", "\\$").replace('"', '\\"'))
 
 
-def _desktop_exec_line(cwd, run):
+def _desktop_exec_line(cwd, run, mime_types=None):
     """Build an Exec= value that changes into ``cwd`` itself instead of
     relying on the .desktop file's Path= key. Not every application menu /
     launcher (e.g. several dmenu-style launchers used on tiling window
     managers) honours Path=, which makes a launcher with a relative run
     command silently fail to open on those setups while working fine on a
-    desktop environment that does honour it."""
+    desktop environment that does honour it.
+
+    When the app declares ``mime_types``, the file(s) the desktop
+    environment opens it with are forwarded as arguments (via %F) so the
+    app can actually open what was double-clicked, not just start empty."""
     shell_cmd = f"cd {shlex.quote(cwd)} && {run}"
+    if mime_types:
+        shell_cmd += ' "$@"'
+        return f'sh -c "{_desktop_exec_quote(shell_cmd)}" _ %F'
     return f'sh -c "{_desktop_exec_quote(shell_cmd)}"'
 
 
@@ -1568,7 +1576,8 @@ class CodeMaster(QMainWindow):
         # Keep the Path key for desktop environments that honour it, but make
         # Exec self-contained (see _desktop_exec_line) so the launcher also
         # works on the ones that don't.
-        exec_line = _desktop_exec_line(cwd, run)
+        mime_types = app.get("mime_types") or []
+        exec_line = _desktop_exec_line(cwd, run, mime_types)
         categories = DESKTOP_CATEGORIES.get(app.get("category", ""), "Utility;")
         # Comment must be a single line per the Desktop Entry Spec.
         comment = (app.get("tagline")
@@ -1584,6 +1593,10 @@ class CodeMaster(QMainWindow):
             f"Icon={icon_png}\n"
             "Terminal=false\n"
             f"Categories={categories}\n"
+        )
+        if mime_types:
+            content += f"MimeType={';'.join(mime_types)};\n"
+        content += (
             "StartupNotify=true\n"
             f"X-CodeMaster-Key={app['key']}\n"
         )
@@ -1596,8 +1609,27 @@ class CodeMaster(QMainWindow):
             QMessageBox.warning(self, "Launcher", f"Could not write launcher:\n{exc}")
             return
         self._update_desktop_db()
+        if mime_types:
+            self._register_mime_defaults(path.name, mime_types)
+            self._toast(f"Added '{app['name']}' to your application menu "
+                        "and set it as the default app for its file types")
+        else:
+            self._toast(f"Added '{app['name']}' to your application menu")
         self.refresh_views()
-        self._toast(f"Added '{app['name']}' to your application menu")
+
+    @staticmethod
+    def _register_mime_defaults(desktop_id, mime_types):
+        """Make this launcher the default handler for its declared MIME
+        types, so double-clicking a matching file actually opens the app
+        instead of just adding it to the menu."""
+        if not shutil.which("xdg-mime"):
+            return
+        for mime in mime_types:
+            try:
+                subprocess.run(["xdg-mime", "default", desktop_id, mime],
+                               capture_output=True)
+            except Exception:
+                pass  # not fatal — the launcher still works, just not as default
 
     def remove_launcher(self, app):
         self._launcher_path(app).unlink(missing_ok=True)
@@ -1665,6 +1697,7 @@ class CodeMaster(QMainWindow):
                 "version": str(app.get("version", "")),
                 "subdir": app.get("subdir", "."), "run": app.get("run", ""),
                 "requirements": app.get("requirements"),
+                "mime_types": app.get("mime_types") or [],
                 "repo_root": folder, "source": "manual",
             }
             count += 1

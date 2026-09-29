@@ -30,6 +30,12 @@ def test_desktop_exec_line_wraps_cd_and_run():
     assert line == 'sh -c "cd /home/user/App && python3 app.py"'
 
 
+def test_desktop_exec_line_forwards_opened_files_when_app_has_mime_types():
+    line = cm._desktop_exec_line("/home/user/App", "python3 app.py",
+                                 mime_types=["image/png"])
+    assert line == 'sh -c "cd /home/user/App && python3 app.py \\"\\$@\\"" _ %F'
+
+
 # -- apt dependency mapping --------------------------------------------------- #
 def test_apt_package_name_strips_version_constraint():
     assert cm._apt_package_name("PyQt5>=5.15,<6") == "python3-pyqt5"
