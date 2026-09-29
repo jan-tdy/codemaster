@@ -24,6 +24,7 @@ import tempfile
 import hashlib
 import base64
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 APP_NAME = "Jadiv Code Master"
@@ -342,11 +343,37 @@ class CatalogLoader(QThread):
     failed = pyqtSignal(str)
     status = pyqtSignal(str)
 
-    def __init__(self, username, branch, token=""):
+    # How many repos to scan over the network at once. GitHub's REST API
+    # has no documented hard cap on concurrent requests, but a very high
+    # number risks tripping its secondary (abuse) rate limit — 8 keeps
+    # scans fast without doing that.
+    MAX_PARALLEL_SCANS = 8
+
+    def __init__(self, username, branch, token="", cached_apps=None):
         super().__init__()
         self.username = username
         self.branch = branch
         self.token = token
+        # A shared Session reuses TCP/TLS connections across the parallel
+        # scan requests below instead of opening a fresh one per call.
+        self.session = requests.Session()
+        # Apps from the last successful scan, grouped by repo, so a repo
+        # whose `pushed_at` hasn't moved since then can be skipped
+        # entirely instead of re-fetching metadata/release/commit/icon.
+        self._cache_by_repo = {}
+        for app in cached_apps or []:
+            if app.get("repo_pushed_at") and app.get("repo"):
+                self._cache_by_repo.setdefault(app["repo"], []).append(app)
+
+    def _cached_apps_for(self, repo, pushed_at):
+        """Previously-scanned apps for ``repo``, or None if there's no
+        usable cache entry (never scanned, or the repo changed since)."""
+        apps = self._cache_by_repo.get(repo)
+        if not apps or not pushed_at:
+            return None
+        if apps[0].get("repo_pushed_at") != pushed_at:
+            return None
+        return apps
 
     def _headers(self):
         """Build the optional GitHub API authorization headers.
@@ -392,7 +419,7 @@ class CatalogLoader(QThread):
             str | None: The authenticated GitHub login, or `None` if it cannot be determined.
         """
         try:
-            resp = requests.get("https://api.github.com/user",
+            resp = self.session.get("https://api.github.com/user",
                                 headers=self._headers(), timeout=20)
             resp.raise_for_status()
             return resp.json().get("login", "")
@@ -400,11 +427,14 @@ class CatalogLoader(QThread):
             return None
 
     def _list_repos(self):
-        """List repositories owned by the configured GitHub user.
-        
+        """List non-archived repositories owned by the configured GitHub
+        user.
+
         Returns:
-            list[tuple[str, str, bool]]: Repository name, default branch, and private
-            status for each owned repository.
+            list[tuple[str, str, bool, str]]: Repository name, default
+            branch, private status, and last-push timestamp (used to skip
+            re-scanning repos that haven't changed) for each owned,
+            non-archived repository.
         """
         repos, page = [], 1
         use_user_repos = False
@@ -420,17 +450,21 @@ class CatalogLoader(QThread):
             extra = ""
         while True:
             url = f"{url_base}?per_page=100&page={page}{extra}"
-            resp = requests.get(url, headers=self._headers(), timeout=20)
+            resp = self.session.get(url, headers=self._headers(), timeout=20)
             self._raise_for_status(resp)
             chunk = resp.json()
             if not chunk:
                 break
             for r in chunk:
+                # Archived repos are frozen (read-only) on GitHub, so their
+                # published apps can't change either — skip scanning them.
+                if r.get("archived"):
+                    continue
                 owner = (r.get("owner") or {}).get("login", "")
                 if use_user_repos and owner.lower() != self.username.lower():
                     continue
                 repos.append((r["name"], r.get("default_branch", "main"),
-                             bool(r.get("private"))))
+                             bool(r.get("private")), r.get("pushed_at", "")))
             if len(chunk) < 100:
                 break
             page += 1
@@ -445,7 +479,7 @@ class CatalogLoader(QThread):
             raw = (f"https://raw.githubusercontent.com/{self.username}/"
                    f"{repo}/{branch}/{METADATA_FILE}")
             try:
-                resp = requests.get(raw, headers=self._headers(), timeout=20)
+                resp = self.session.get(raw, headers=self._headers(), timeout=20)
             except requests.RequestException:
                 continue
             if resp.status_code == 200:
@@ -460,7 +494,7 @@ class CatalogLoader(QThread):
         url = (f"https://api.github.com/repos/{self.username}/"
                f"{repo}/releases/latest")
         try:
-            resp = requests.get(url, headers=self._headers(), timeout=20)
+            resp = self.session.get(url, headers=self._headers(), timeout=20)
             if resp.status_code == 200:
                 return resp.json().get("tag_name")
         except requests.RequestException:
@@ -474,7 +508,7 @@ class CatalogLoader(QThread):
         url = (f"https://api.github.com/repos/{self.username}/"
                f"{repo}/commits/{branch}")
         try:
-            resp = requests.get(url, headers=self._headers(), timeout=20)
+            resp = self.session.get(url, headers=self._headers(), timeout=20)
             if resp.status_code == 200:
                 return resp.json().get("sha")
         except requests.RequestException:
@@ -487,61 +521,100 @@ class CatalogLoader(QThread):
         raw = (f"https://raw.githubusercontent.com/{self.username}/"
                f"{repo}/{branch}/{icon_path}")
         try:
-            resp = requests.get(raw, headers=self._headers(), timeout=20)
+            resp = self.session.get(raw, headers=self._headers(), timeout=20)
             if resp.status_code == 200:
                 return resp.content
         except requests.RequestException:
             return None
         return None
 
+    def _scan_repo(self, repo, default_branch, is_private, pushed_at):
+        """Fetch metadata/release/commit/icon for one repo. Called from a
+        worker thread (see ``run``); returns the app dicts it publishes,
+        or an empty list if it has no ``codemaster-metadata.json``."""
+        meta, branch = self._fetch_metadata(repo, default_branch)
+        if not meta:
+            return []
+        release_tag = None
+        if any(a.get("update_method") == "release"
+               for a in meta.get("apps", [])):
+            release_tag = self._fetch_release(repo)
+        sync_commit = None
+        if any(a.get("update_method", "sync") != "release"
+               for a in meta.get("apps", [])):
+            sync_commit = self._fetch_latest_commit(repo, branch)
+        apps = []
+        for app in meta.get("apps", []):
+            icon_data = self._fetch_icon(repo, branch, app.get("icon"))
+            method = app.get("update_method", "sync")
+            apps.append({
+                "key": f"{repo}/{app.get('id')}",
+                "repo": repo,
+                "repo_pushed_at": pushed_at,
+                "branch": branch,
+                "id": app.get("id"),
+                "name": app.get("name", app.get("id", "?")),
+                "tagline": app.get("tagline", ""),
+                "description": app.get("description", ""),
+                "category": app.get("category", "Other"),
+                "version": str(app.get("version", "")),
+                "author": app.get("author", self.username),
+                "icon_data": icon_data,
+                "subdir": app.get("subdir", "."),
+                "entrypoint": app.get("entrypoint", ""),
+                "run": app.get("run", ""),
+                "requirements": app.get("requirements"),
+                "mime_types": app.get("mime_types") or [],
+                "maintained": app.get("maintained", True),
+                "update_method": method,
+                "release_tag": release_tag if method == "release"
+                               else None,
+                "latest_commit": sync_commit if method != "release"
+                                 else None,
+                "homepage": app.get("homepage")
+                            or meta.get("homepage"),
+                "private": is_private,
+            })
+        return apps
+
     def run(self):
         try:
             self.status.emit("Contacting GitHub…")
             apps = []
             repos = self._list_repos()
-            for repo, default_branch, is_private in repos:
-                self.status.emit(f"Scanning {repo}…")
-                meta, branch = self._fetch_metadata(repo, default_branch)
-                if not meta:
-                    continue
-                release_tag = None
-                if any(a.get("update_method") == "release"
-                       for a in meta.get("apps", [])):
-                    release_tag = self._fetch_release(repo)
-                sync_commit = None
-                if any(a.get("update_method", "sync") != "release"
-                       for a in meta.get("apps", [])):
-                    sync_commit = self._fetch_latest_commit(repo, branch)
-                for app in meta.get("apps", []):
-                    icon_data = self._fetch_icon(repo, branch, app.get("icon"))
-                    method = app.get("update_method", "sync")
-                    apps.append({
-                        "key": f"{repo}/{app.get('id')}",
-                        "repo": repo,
-                        "branch": branch,
-                        "id": app.get("id"),
-                        "name": app.get("name", app.get("id", "?")),
-                        "tagline": app.get("tagline", ""),
-                        "description": app.get("description", ""),
-                        "category": app.get("category", "Other"),
-                        "version": str(app.get("version", "")),
-                        "author": app.get("author", self.username),
-                        "icon_data": icon_data,
-                        "subdir": app.get("subdir", "."),
-                        "entrypoint": app.get("entrypoint", ""),
-                        "run": app.get("run", ""),
-                        "requirements": app.get("requirements"),
-                        "mime_types": app.get("mime_types") or [],
-                        "maintained": app.get("maintained", True),
-                        "update_method": method,
-                        "release_tag": release_tag if method == "release"
-                                       else None,
-                        "latest_commit": sync_commit if method != "release"
-                                         else None,
-                        "homepage": app.get("homepage")
-                                    or meta.get("homepage"),
-                        "private": is_private,
-                    })
+
+            # Repos whose last push hasn't moved since the previous
+            # successful scan are reused from cache without any network
+            # call — this is what keeps a scan fast as more repos pile up:
+            # only genuinely new or changed repos need fetching.
+            to_scan = []
+            for repo, default_branch, is_private, pushed_at in repos:
+                cached = self._cached_apps_for(repo, pushed_at)
+                if cached is not None:
+                    apps.extend(cached)
+                else:
+                    to_scan.append((repo, default_branch, is_private, pushed_at))
+
+            if to_scan:
+                skipped = len(repos) - len(to_scan)
+                note = f" ({skipped} unchanged, cached)" if skipped else ""
+                self.status.emit(f"Scanning {len(to_scan)} repo(s){note}…")
+                done = 0
+                workers = min(self.MAX_PARALLEL_SCANS, len(to_scan))
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {
+                        pool.submit(self._scan_repo, repo, default_branch,
+                                    is_private, pushed_at): repo
+                        for repo, default_branch, is_private, pushed_at
+                        in to_scan
+                    }
+                    for future in as_completed(futures):
+                        repo = futures[future]
+                        done += 1
+                        self.status.emit(
+                            f"Scanning {repo}… ({done}/{len(to_scan)})")
+                        apps.extend(future.result())
+
             apps.sort(key=lambda a: (a["category"].lower(), a["name"].lower()))
             self.loaded.emit(apps)
         except Exception as exc:  # noqa: BLE001
@@ -1126,7 +1199,7 @@ class CodeMaster(QMainWindow):
                 "Scanning every jan-tdy repository on GitHub for apps…\n"
                 "This can take up to a minute on the first run.")
         loader = CatalogLoader(self.config["username"], self.config["branch"],
-                               self.config["token"])
+                               self.config["token"], cached_apps=self.catalog)
         loader.loaded.connect(self.on_catalog_loaded)
         loader.failed.connect(self.on_catalog_failed)
         loader.status.connect(
