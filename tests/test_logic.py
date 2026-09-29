@@ -566,3 +566,81 @@ def test_raise_for_status_ignores_healthy_response():
     loader = _bare_loader()
     resp = _FakeResponse(200, {})
     loader._raise_for_status(resp)  # must not raise
+
+
+# -- CatalogLoader repo-scan skip cache --------------------------------------- #
+def test_catalog_loader_init_groups_cached_apps_by_repo():
+    cached_apps = [
+        {"repo": "repo-a", "repo_pushed_at": "t1", "id": "app1"},
+        {"repo": "repo-a", "repo_pushed_at": "t1", "id": "app2"},
+        # Pre-upgrade cache entries without repo_pushed_at are ignored,
+        # not treated as a cache hit for an unscanned repo.
+        {"repo": "repo-b", "id": "app3"},
+    ]
+    loader = cm.CatalogLoader("jan-tdy", "main", "", cached_apps=cached_apps)
+    assert set(loader._cache_by_repo.keys()) == {"repo-a"}
+    assert len(loader._cache_by_repo["repo-a"]) == 2
+
+
+def test_cached_apps_for_hits_when_pushed_at_matches():
+    loader = _bare_loader()
+    loader._cache_by_repo = {
+        "repo-a": [{"repo": "repo-a", "repo_pushed_at": "t1", "id": "app1"}],
+    }
+    cached = loader._cached_apps_for("repo-a", "t1")
+    assert cached is not None and cached[0]["id"] == "app1"
+
+
+def test_cached_apps_for_misses_when_repo_changed_since():
+    loader = _bare_loader()
+    loader._cache_by_repo = {
+        "repo-a": [{"repo": "repo-a", "repo_pushed_at": "t1", "id": "app1"}],
+    }
+    assert loader._cached_apps_for("repo-a", "t2") is None
+
+
+def test_cached_apps_for_misses_when_repo_never_scanned():
+    loader = _bare_loader()
+    loader._cache_by_repo = {}
+    assert loader._cached_apps_for("repo-a", "t1") is None
+
+
+class _FakeRepoListResponse:
+    def __init__(self, repos):
+        self.status_code = 200
+        self.headers = {}
+        self._repos = repos
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._repos
+
+
+class _FakeSession:
+    """Serves one page of /repos results, ignoring pagination params."""
+
+    def __init__(self, repos):
+        self._repos = repos
+        self.calls = 0
+
+    def get(self, url, headers=None, timeout=None):
+        self.calls += 1
+        return _FakeRepoListResponse(self._repos if self.calls == 1 else [])
+
+
+def test_list_repos_skips_archived_and_reports_pushed_at():
+    loader = _bare_loader(token="")
+    loader.username = "jan-tdy"
+    loader.session = _FakeSession([
+        {"name": "active-repo", "default_branch": "main", "private": False,
+         "archived": False, "pushed_at": "2026-01-01T00:00:00Z",
+         "owner": {"login": "jan-tdy"}},
+        {"name": "old-repo", "default_branch": "main", "private": False,
+         "archived": True, "pushed_at": "2020-01-01T00:00:00Z",
+         "owner": {"login": "jan-tdy"}},
+    ])
+    assert loader._list_repos() == [
+        ("active-repo", "main", False, "2026-01-01T00:00:00Z"),
+    ]
