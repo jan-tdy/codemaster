@@ -42,7 +42,16 @@ QPushButton#Ghost { background: transparent; color: #cdd3df;
 QPushButton#Ghost:hover { border: 1px solid #4f8cff; color: #fff; }
 QTextEdit, QLineEdit { background: #1b1e26; border: 1px solid #2a2e3a;
     border-radius: 8px; padding: 8px; color: #e7e9ee; }
+QComboBox { background: #1b1e26; border: 1px solid #2a2e3a; border-radius: 8px;
+    padding: 6px 10px; color: #e7e9ee; }
+QComboBox:hover { border: 1px solid #4f8cff; }
+QComboBox::drop-down { border: none; width: 22px; }
+QComboBox QAbstractItemView { background: #1b1e26; color: #e7e9ee;
+    border: 1px solid #333a48; selection-background-color: #1f2430;
+    selection-color: #e7e9ee; outline: none; }
 QScrollBar:vertical { background: #14161c; width: 10px; }
 QScrollBar::handle:vertical { background: #333a48; border-radius: 5px; }
+QScrollBar:horizontal { background: #14161c; height: 10px; }
+QScrollBar::handle:horizontal { background: #333a48; border-radius: 5px; }
 QStatusBar { background: #1b1e26; color: #9aa3b2; }
 """

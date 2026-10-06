@@ -22,7 +22,7 @@ from codemaster.git_worker import GitWorker, apt_package_name, apt_requirement_s
 from codemaster.main_window import CodeMaster, app_source  # noqa: E402
 from codemaster.constants import APP_VERSION, xdg_data_home  # noqa: E402
 from codemaster.widgets import (  # noqa: E402
-    AppTile, CategorySidebar, DetailsPage, FilterBar, format_version,
+    AppTile, CategorySidebar, DetailsPage, FilterBar, TileGrid, format_version,
 )
 
 
@@ -1255,6 +1255,37 @@ def test_details_page_always_offers_update_for_installed_flatpak():
     from PyQt5.QtWidgets import QPushButton
     labels = [b.text() for b in page.findChildren(QPushButton)]
     assert "Update" in labels
+
+
+# -- tile grid placeholder / resize -------------------------------------- #
+def test_tile_grid_resize_while_placeholder_shown_keeps_it_in_the_grid():
+    # Regression test: _reflow() ran on every resizeEvent and used to just
+    # "return" when self._tiles was empty, after already taking the
+    # placeholder out of the grid's own bookkeeping — so a resize that
+    # landed while a placeholder was showing (e.g. "No apps yet") silently
+    # dropped it from the layout. It stayed a visible child widget with
+    # no layout managing its geometry until the next set_tiles() call
+    # happened to .hide() it, which could show up as a stray stuck label.
+    grid = TileGrid()
+    grid.set_placeholder("No apps yet — press Refresh to load from GitHub.")
+    assert grid._grid.indexOf(grid._placeholder) != -1
+
+    grid._reflow()  # what resizeEvent does
+
+    assert grid._grid.indexOf(grid._placeholder) != -1
+
+
+def test_tile_grid_set_tiles_after_resize_still_clears_the_placeholder():
+    from PyQt5.QtWidgets import QLabel
+    grid = TileGrid()
+    grid.set_placeholder("No apps yet.")
+    grid._reflow()  # simulate a resize while the placeholder is showing
+
+    tile = QLabel("fake tile")
+    grid.set_tiles([tile])
+
+    assert grid._grid.indexOf(grid._placeholder) == -1
+    assert grid._grid.indexOf(tile) != -1
 
 
 # -- version display -------------------------------------------------------- #

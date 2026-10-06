@@ -59,15 +59,22 @@ class TileGrid(QScrollArea):
         self._placeholder.setObjectName("Placeholder")
         self._placeholder.setAlignment(Qt.AlignCenter)
         self._placeholder.setWordWrap(True)
+        # _reflow() is the single place that puts something into the grid
+        # (tiles or the placeholder) — this flag is the only thing that
+        # tells it which, so a resize event in between set_placeholder()
+        # and the next set_tiles() still re-adds the placeholder instead
+        # of leaving it taken out of the layout (see _reflow).
+        self._showing_placeholder = False
         self.setWidget(self._holder)
 
     def set_placeholder(self, text):
         self.set_tiles([])
-        self._grid.addWidget(self._placeholder, 0, 0)
+        self._showing_placeholder = True
         self._placeholder.setText(text)
-        self._placeholder.show()
+        self._reflow()
 
     def set_tiles(self, tiles):
+        self._showing_placeholder = False
         for i in reversed(range(self._grid.count())):
             item = self._grid.takeAt(i)
             w = item.widget()
@@ -82,8 +89,21 @@ class TileGrid(QScrollArea):
         self._reflow()
 
     def _reflow(self):
+        # Every call starts from an empty grid and re-adds exactly one of
+        # (the placeholder) or (the current tiles) — never both, and
+        # never neither while one is supposed to be showing. Without this,
+        # a resizeEvent arriving while the placeholder is up would take it
+        # out of the grid's bookkeeping here and have nothing put it back,
+        # since "if not self._tiles: return" used to just stop — leaving a
+        # label that's still a visible child widget but no longer
+        # layout-managed, until the next set_tiles()/set_placeholder() call
+        # happened to clean it up.
         for i in reversed(range(self._grid.count())):
             self._grid.takeAt(i)
+        if self._showing_placeholder:
+            self._grid.addWidget(self._placeholder, 0, 0)
+            self._placeholder.show()
+            return
         if not self._tiles:
             return
         width = max(self.viewport().width(), self._tile_width)
