@@ -7,10 +7,10 @@
     {
       "id": "codemaster",
       "name": "Jadiv Code Master",
-      "tagline": "App store & code runner for jan-tdy apps",
-      "description": "A desktop app store for discovering, installing, updating and launching jan-tdy applications. Also bundles a small code editor/runner and a GitHub downloader.",
+      "tagline": "A universal app store: jan-tdy apps, a community catalog, and apt/snap/flatpak",
+      "description": "A desktop app store for discovering, installing, updating and launching jan-tdy applications and community-submitted apps, plus browsing and installing apt, snap and Flatpak packages.",
       "category": "Developer Tools",
-      "version": "0.3.1",
+      "version": "2.0.0-beta0",
       "author": "JapySoft TDY",
       "icon": "assets/codemaster.svg",
       "subdir": ".",
