@@ -10,7 +10,7 @@
       "tagline": "A universal app store: jan-tdy apps, a community catalog, and apt/snap/flatpak",
       "description": "A desktop app store for discovering, installing, updating and launching jan-tdy applications and community-submitted apps, plus browsing and installing apt, snap and Flatpak packages.",
       "category": "Developer Tools",
-      "version": "2.0.0-beta0",
+      "version": "2.0.0-beta3",
       "author": "JapySoft TDY",
       "icon": "assets/codemaster.svg",
       "subdir": ".",

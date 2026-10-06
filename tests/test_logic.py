@@ -22,7 +22,7 @@ from codemaster.git_worker import GitWorker, apt_package_name, apt_requirement_s
 from codemaster.main_window import CodeMaster, app_source  # noqa: E402
 from codemaster.constants import APP_VERSION, xdg_data_home  # noqa: E402
 from codemaster.widgets import (  # noqa: E402
-    AppTile, CategorySidebar, DetailsPage, FilterBar, format_version,
+    AppTile, CategorySidebar, DetailsPage, FilterBar, TileGrid, format_version,
 )
 
 
@@ -958,10 +958,8 @@ def test_apt_search_parses_name_dash_summary_lines(monkeypatch):
 
 def test_apt_installed_parses_dpkg_query_tab_output(monkeypatch):
     monkeypatch.setattr(system_packages.shutil, "which", lambda name: "/usr/bin/dpkg-query")
-    monkeypatch.setattr(system_packages.AptBackend, "_installed_app_packages",
-                        staticmethod(lambda: {"gimp", "vlc"}))
-    monkeypatch.setattr(system_packages.AptBackend, "_desktop_entry_for_package",
-                        staticmethod(lambda pkg: None))
+    monkeypatch.setattr(system_packages.AptBackend, "_gui_desktop_entries",
+                        staticmethod(lambda: {"gimp": {}, "vlc": {}}))
     monkeypatch.setattr(system_packages, "_run", lambda cmd, timeout=120:
                         "gimp\t2.10.34\nvlc\t3.0.20\nlibc6\t2.39\n")
     assert system_packages.AptBackend.installed() == {
@@ -975,15 +973,35 @@ def test_apt_installed_uses_desktop_entry_name_and_icon(monkeypatch):
     # and icon via their own .desktop file used to show up with their bare
     # dpkg package name and a lettered placeholder instead.
     monkeypatch.setattr(system_packages.shutil, "which", lambda name: "/usr/bin/dpkg-query")
-    monkeypatch.setattr(system_packages.AptBackend, "_installed_app_packages",
-                        staticmethod(lambda: {"gimp"}))
-    monkeypatch.setattr(system_packages.AptBackend, "_desktop_entry_for_package",
-                        staticmethod(lambda pkg: {"name": "GIMP", "icon": "gimp"}))
+    monkeypatch.setattr(system_packages.AptBackend, "_gui_desktop_entries",
+                        staticmethod(lambda: {"gimp": {"name": "GIMP", "icon": "gimp"}}))
     monkeypatch.setattr(system_packages, "resolve_icon_bytes", lambda icon: b"icon-bytes")
     monkeypatch.setattr(system_packages, "_run", lambda cmd, timeout=120: "gimp\t2.10.34\n")
     assert system_packages.AptBackend.installed() == {
         "gimp": {"version": "2.10.34", "name": "GIMP", "icon_data": b"icon-bytes"},
     }
+
+
+def test_apt_gui_desktop_entries_reads_each_file_once(tmp_path, monkeypatch):
+    # Regression test: installed() and _installed_app_packages() used to
+    # each independently re-scan every dpkg file list and re-parse every
+    # matching .desktop file — _gui_desktop_entries() is the single pass
+    # both now build on, so one call must account for all the I/O.
+    info_dir = tmp_path / "info"
+    info_dir.mkdir()
+    (info_dir / "gimp.list").write_text(
+        "/usr\n/usr/share/applications/gimp.desktop\n", encoding="utf-8")
+    monkeypatch.setattr(system_packages.AptBackend, "DPKG_INFO_DIR", info_dir)
+    reads = []
+
+    def fake_parse(path):
+        reads.append(path)
+        return {"name": "GIMP", "icon": "gimp"}
+
+    monkeypatch.setattr(system_packages, "parse_desktop_entry", fake_parse)
+    entries = system_packages.AptBackend._gui_desktop_entries()
+    assert entries == {"gimp": {"name": "GIMP", "icon": "gimp"}}
+    assert len(reads) == 1  # not re-parsed once per caller
 
 
 def test_apt_upgradable_parses_apt_list_output(monkeypatch):
@@ -1017,8 +1035,8 @@ def test_apt_installed_returns_nothing_without_desktop_apps(monkeypatch):
     # applications — without the desktop-entry filter, every one of them
     # would show up as an "installed app" tile.
     monkeypatch.setattr(system_packages.shutil, "which", lambda name: "/usr/bin/dpkg-query")
-    monkeypatch.setattr(system_packages.AptBackend, "_installed_app_packages",
-                        staticmethod(lambda: set()))
+    monkeypatch.setattr(system_packages.AptBackend, "_gui_desktop_entries",
+                        staticmethod(lambda: {}))
     calls = []
     monkeypatch.setattr(system_packages, "_run",
                         lambda cmd, timeout=120: calls.append(cmd) or "")
@@ -1039,8 +1057,8 @@ def test_installed_app_packages_reads_dpkg_file_lists(tmp_path, monkeypatch):
     # The actual .desktop files' content (Terminal=/NoDisplay=/Hidden=) is
     # covered by test_is_gui_desktop_entry_* below; here only the dpkg
     # file-list path matching is under test.
-    monkeypatch.setattr(system_packages.AptBackend, "_is_gui_desktop_entry",
-                        staticmethod(lambda path: True))
+    monkeypatch.setattr(system_packages, "parse_desktop_entry",
+                        lambda path: {"name": "x", "icon": None})
     assert system_packages.AptBackend._installed_app_packages() == {"gimp", "vlc"}
 
 
@@ -1181,12 +1199,19 @@ def test_app_tile_button_label_reflects_install_state():
     assert buttons2[-1].text() == "Details"
 
 
-def test_details_page_show_app_does_not_leak_widgets_across_apps():
+def test_details_page_show_app_does_not_leak_widgets_across_apps(monkeypatch):
     # Regression test: _lay.addLayout(header)/addLayout(actions) nest
     # plain QLayouts, not QWidgets — a takeAt()-based clear() never finds
     # a widget() on those items, so the action buttons inside them used to
     # never get deleted and piled up, visibly overlapping, every time
     # show_app() ran again for a different (or the same) app.
+    #
+    # git apps trigger a real ReadmeLoader thread; keep it offline and
+    # instant so this test's outcome doesn't depend on network access.
+    def no_network(*_a, **_kw):
+        raise requests.RequestException("no network in tests")
+    monkeypatch.setattr("codemaster.widgets.requests.get", no_network)
+
     store = _bare_store()
     store.config = {"username": "jan-tdy"}
     store.installed = {"jan-tdy/repo/app1": {}, "jan-tdy/repo/app2": {}}
@@ -1209,6 +1234,58 @@ def test_details_page_show_app_does_not_leak_widgets_across_apps():
 
     assert count_1 == count_2 == count_3
     assert count_1 > 0
+
+
+def test_details_page_always_offers_update_for_installed_flatpak():
+    # Regression test: has_update() is always False for flatpak (it's
+    # never probed — FlatpakBackend.upgradable() is always empty), but
+    # the Update button is documented and intended to show anyway, once
+    # installed, trusting flatpak itself to no-op if there's nothing to
+    # do. _actions() used to gate the button on has_update() alone, so it
+    # could never appear for flatpak at all.
+    store = _bare_store()
+    store.system_installed = {"apt": {}, "snap": {},
+                              "flatpak": {"org.gimp.GIMP": {"version": "2.10",
+                                                           "name": "GIMP",
+                                                           "icon_data": None}}}
+    page = DetailsPage(store)
+    app = {"backend": "flatpak", "pkg_id": "org.gimp.GIMP", "name": "GIMP",
+          "category": "Flatpak packages", "version": "2.10"}
+    page.show_app(app)
+    from PyQt5.QtWidgets import QPushButton
+    labels = [b.text() for b in page.findChildren(QPushButton)]
+    assert "Update" in labels
+
+
+# -- tile grid placeholder / resize -------------------------------------- #
+def test_tile_grid_resize_while_placeholder_shown_keeps_it_in_the_grid():
+    # Regression test: _reflow() ran on every resizeEvent and used to just
+    # "return" when self._tiles was empty, after already taking the
+    # placeholder out of the grid's own bookkeeping — so a resize that
+    # landed while a placeholder was showing (e.g. "No apps yet") silently
+    # dropped it from the layout. It stayed a visible child widget with
+    # no layout managing its geometry until the next set_tiles() call
+    # happened to .hide() it, which could show up as a stray stuck label.
+    grid = TileGrid()
+    grid.set_placeholder("No apps yet — press Refresh to load from GitHub.")
+    assert grid._grid.indexOf(grid._placeholder) != -1
+
+    grid._reflow()  # what resizeEvent does
+
+    assert grid._grid.indexOf(grid._placeholder) != -1
+
+
+def test_tile_grid_set_tiles_after_resize_still_clears_the_placeholder():
+    from PyQt5.QtWidgets import QLabel
+    grid = TileGrid()
+    grid.set_placeholder("No apps yet.")
+    grid._reflow()  # simulate a resize while the placeholder is showing
+
+    tile = QLabel("fake tile")
+    grid.set_tiles([tile])
+
+    assert grid._grid.indexOf(grid._placeholder) == -1
+    assert grid._grid.indexOf(tile) != -1
 
 
 # -- version display -------------------------------------------------------- #
