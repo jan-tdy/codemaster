@@ -194,59 +194,50 @@ class AptBackend:
             return []
 
     @staticmethod
-    def _desktop_entry_for_package(pkg):
-        """The first real GUI {"name", "icon"} entry ``pkg`` ships, or
-        None — used to show the package's actual application name/icon
-        instead of its bare dpkg name and a lettered placeholder."""
-        list_file = AptBackend.DPKG_INFO_DIR / f"{pkg}.list"
-        if not list_file.exists():
-            # Multi-arch packages are named "<pkg>:<arch>.list".
-            matches = sorted(AptBackend.DPKG_INFO_DIR.glob(f"{pkg}:*.list"))
-            if not matches:
-                return None
-            list_file = matches[0]
-        for path in AptBackend._desktop_paths_for_package(list_file):
-            entry = parse_desktop_entry(path)
-            if entry:
-                return entry
-        return None
-
-    @staticmethod
-    def _installed_app_packages():
-        """Names of installed apt packages that ship a genuine GUI desktop
-        entry.
+    def _gui_desktop_entries():
+        """{package: {"name", "icon"}} for every installed apt package
+        that ships a genuine GUI desktop entry.
 
         dpkg tracks every package on the system — base libraries, fonts,
         kernel modules, thousands of them even on a minimal desktop — not
         just applications, and plenty of those still drop a menu entry for
-        a command-line tool (python3.12, a JRE's policytool, ...). Reading
-        dpkg's own per-package file lists first (no subprocess per package)
-        keeps the common case fast; the handful of path hits that remain
-        are then checked against ``_is_gui_desktop_entry`` to drop the
-        terminal/hidden ones."""
+        a command-line tool (python3.12, a JRE's policytool, ...). This
+        reads each package's own dpkg file list exactly once and parses
+        each candidate ``.desktop`` path exactly once — ``installed()``
+        and ``_installed_app_packages()`` both build on this single pass
+        instead of each re-reading every file list and ``.desktop`` file
+        of their own."""
         if not AptBackend.DPKG_INFO_DIR.is_dir():
-            return set()
-        app_packages = set()
+            return {}
+        result = {}
         for list_file in AptBackend.DPKG_INFO_DIR.glob("*.list"):
             # Multi-arch packages are named "<pkg>:<arch>.list".
             pkg = list_file.stem.split(":", 1)[0]
-            if any(AptBackend._is_gui_desktop_entry(path) for path in
-                  AptBackend._desktop_paths_for_package(list_file)):
-                app_packages.add(pkg)
-        return app_packages
+            for path in AptBackend._desktop_paths_for_package(list_file):
+                entry = parse_desktop_entry(path)
+                if entry:
+                    result[pkg] = entry
+                    break
+        return result
+
+    @staticmethod
+    def _installed_app_packages():
+        """Names of installed apt packages that ship a genuine GUI desktop
+        entry (see ``_gui_desktop_entries``)."""
+        return set(AptBackend._gui_desktop_entries())
 
     @staticmethod
     def installed():
         """{package: {"version", "name", "icon_data"}}, restricted to
-        installed apt packages that are actual applications (see
-        ``_installed_app_packages``) — not every one of the thousands of
-        packages dpkg happens to track. name/icon_data come from the
-        package's own .desktop entry when it has one, the same name and
-        icon its application-menu launcher already shows."""
+        installed apt packages that are actual applications — not every
+        one of the thousands of packages dpkg happens to track.
+        name/icon_data come from the package's own .desktop entry when it
+        has one, the same name and icon its application-menu launcher
+        already shows."""
         if not shutil.which("dpkg-query"):
             return {}
-        app_packages = AptBackend._installed_app_packages()
-        if not app_packages:
+        entries = AptBackend._gui_desktop_entries()
+        if not entries:
             return {}
         try:
             out = _run(["dpkg-query", "-W", "-f=${Package}\\t${Version}\\n"])
@@ -257,9 +248,9 @@ class AptBackend:
             if "\t" not in line:
                 continue
             pkg, version = line.split("\t", 1)
-            if pkg not in app_packages:
+            entry = entries.get(pkg)
+            if entry is None:
                 continue
-            entry = AptBackend._desktop_entry_for_package(pkg) or {}
             result[pkg] = {
                 "version": version,
                 "name": entry.get("name") or pkg,

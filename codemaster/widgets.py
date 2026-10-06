@@ -517,9 +517,15 @@ class DetailsPage(QScrollArea):
             if app.get("homepage"):
                 actions.append(("Open homepage", "Ghost", c.open_homepage))
             return actions
-        if c.has_update(app):
+        # Flatpak updates aren't probed (FlatpakBackend.upgradable() is
+        # always empty — see its docstring), so has_update() is always
+        # False for it; its Update button is offered unconditionally
+        # instead of never, trusting flatpak itself to no-op if there's
+        # nothing to do.
+        show_update = c.has_update(app) or app.get("backend") == "flatpak"
+        if show_update:
             actions.append(("Update", "Primary", c.update_app))
-        actions.append(("Open", "Primary" if not c.has_update(app) else "Ghost",
+        actions.append(("Open", "Primary" if not show_update else "Ghost",
                         c.launch_app))
         if app.get("backend") == "git":
             if c.has_launcher(app):
