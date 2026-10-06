@@ -15,7 +15,8 @@ A single git repository can publish several apps — for example
 [`devcontrolenterpise`](https://github.com/jan-tdy/devcontrolenterpise)
 publishes the Telescope Cover, Astrofoto, Atacama (C14) and DSLR apps.
 
-<img width="668" height="515" alt="image" src="https://github.com/user-attachments/assets/d9ffb44d-734e-4255-8676-1b67f46d4fca" />
+<img width="1186" height="794" alt="image" src="https://github.com/user-attachments/assets/9f629815-124e-4787-98c1-f09f9480cd02" />
+
 
 ---
 
