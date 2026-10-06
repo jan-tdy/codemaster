@@ -393,25 +393,21 @@ class DetailsPage(QScrollArea):
         self.setObjectName("Page")
         self._readme_cache = {}
         self._readme_loader = None
-        self._build_skeleton()
+        self.setWidget(QWidget())  # placeholder; show_app() builds the real one
 
-    def _build_skeleton(self):
+    def show_app(self, app):
+        self.app = app
+        # A fresh holder widget each time, rather than clearing the old
+        # QVBoxLayout in place: items added with addLayout() (the header
+        # and action rows below) have no widget() of their own, so a
+        # takeAt()-based clear never deletes the buttons/labels nested
+        # inside them — they'd stay on screen, overlapping the new ones on
+        # every app switch. QScrollArea.setWidget() deletes the previous
+        # widget (and that whole child tree) for us.
         holder = QWidget()
         self._lay = QVBoxLayout(holder)
         self._lay.setContentsMargins(24, 18, 24, 24)
         self._lay.setSpacing(12)
-        self.setWidget(holder)
-
-    def _clear(self):
-        while self._lay.count():
-            item = self._lay.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-
-    def show_app(self, app):
-        self.app = app
-        self._clear()
 
         back = QPushButton("←  Back")
         back.setObjectName("Ghost")
@@ -471,6 +467,8 @@ class DetailsPage(QScrollArea):
             desc_lbl.setWordWrap(True)
             self._lay.addWidget(desc_lbl)
             self._lay.addStretch()
+
+        self.setWidget(holder)
 
     def _meta_line(self):
         app = self.app

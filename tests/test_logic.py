@@ -21,7 +21,7 @@ from codemaster.catalog_loader import CatalogLoader  # noqa: E402
 from codemaster.git_worker import GitWorker, apt_package_name, apt_requirement_satisfied  # noqa: E402
 from codemaster.main_window import CodeMaster, app_source  # noqa: E402
 from codemaster.constants import APP_VERSION, xdg_data_home  # noqa: E402
-from codemaster.widgets import AppTile, CategorySidebar, FilterBar  # noqa: E402
+from codemaster.widgets import AppTile, CategorySidebar, DetailsPage, FilterBar  # noqa: E402
 
 
 def _bare_store():
@@ -915,10 +915,76 @@ def test_apt_search_parses_name_dash_summary_lines(monkeypatch):
 
 def test_apt_installed_parses_dpkg_query_tab_output(monkeypatch):
     monkeypatch.setattr(system_packages.shutil, "which", lambda name: "/usr/bin/dpkg-query")
+    monkeypatch.setattr(system_packages.AptBackend, "_installed_app_packages",
+                        staticmethod(lambda: {"gimp", "vlc"}))
     monkeypatch.setattr(system_packages, "_run", lambda cmd, timeout=120:
-                        "gimp\t2.10.34\nvlc\t3.0.20\n")
+                        "gimp\t2.10.34\nvlc\t3.0.20\nlibc6\t2.39\n")
     assert system_packages.AptBackend.installed() == {"gimp": "2.10.34",
                                                        "vlc": "3.0.20"}
+
+
+def test_apt_installed_returns_nothing_without_desktop_apps(monkeypatch):
+    # dpkg tracks thousands of library/dependency packages that are not
+    # applications — without the desktop-entry filter, every one of them
+    # would show up as an "installed app" tile.
+    monkeypatch.setattr(system_packages.shutil, "which", lambda name: "/usr/bin/dpkg-query")
+    monkeypatch.setattr(system_packages.AptBackend, "_installed_app_packages",
+                        staticmethod(lambda: set()))
+    calls = []
+    monkeypatch.setattr(system_packages, "_run",
+                        lambda cmd, timeout=120: calls.append(cmd) or "")
+    assert system_packages.AptBackend.installed() == {}
+    assert calls == []  # short-circuits before even asking dpkg-query for versions
+
+
+def test_installed_app_packages_reads_dpkg_file_lists(tmp_path, monkeypatch):
+    info_dir = tmp_path / "info"
+    info_dir.mkdir()
+    (info_dir / "gimp.list").write_text(
+        "/usr\n/usr/share/applications/gimp.desktop\n", encoding="utf-8")
+    (info_dir / "libc6.list").write_text("/lib/x86_64-linux-gnu/libc.so.6\n",
+                                        encoding="utf-8")
+    (info_dir / "vlc:amd64.list").write_text(
+        "/usr/share/applications/vlc.desktop\n", encoding="utf-8")
+    monkeypatch.setattr(system_packages.AptBackend, "DPKG_INFO_DIR", info_dir)
+    # The actual .desktop files' content (Terminal=/NoDisplay=/Hidden=) is
+    # covered by test_is_gui_desktop_entry_* below; here only the dpkg
+    # file-list path matching is under test.
+    monkeypatch.setattr(system_packages.AptBackend, "_is_gui_desktop_entry",
+                        staticmethod(lambda path: True))
+    assert system_packages.AptBackend._installed_app_packages() == {"gimp", "vlc"}
+
+
+def test_is_gui_desktop_entry_true_for_a_plain_gui_app(tmp_path):
+    desktop = tmp_path / "gimp.desktop"
+    desktop.write_text(
+        "[Desktop Entry]\nType=Application\nName=GIMP\n"
+        "Exec=gimp\n", encoding="utf-8")
+    assert system_packages.AptBackend._is_gui_desktop_entry(desktop) is True
+
+
+def test_is_gui_desktop_entry_false_for_terminal_tools(tmp_path):
+    # Regression test: python3.12.desktop (and similar interpreter/JRE
+    # menu entries dpkg ships) are Terminal=true and/or NoDisplay=true —
+    # without filtering on this, every one of those showed up in the Store
+    # looking exactly like a GUI app.
+    desktop = tmp_path / "python3.12.desktop"
+    desktop.write_text(
+        "[Desktop Entry]\nName=Python (v3.12)\nExec=/usr/bin/python3.12\n"
+        "Terminal=true\nType=Application\nNoDisplay=true\n", encoding="utf-8")
+    assert system_packages.AptBackend._is_gui_desktop_entry(desktop) is False
+
+
+def test_is_gui_desktop_entry_false_for_non_application_type(tmp_path):
+    desktop = tmp_path / "link.desktop"
+    desktop.write_text("[Desktop Entry]\nType=Link\nURL=https://example.com\n",
+                       encoding="utf-8")
+    assert system_packages.AptBackend._is_gui_desktop_entry(desktop) is False
+
+
+def test_is_gui_desktop_entry_false_for_missing_file(tmp_path):
+    assert system_packages.AptBackend._is_gui_desktop_entry(
+        tmp_path / "missing.desktop") is False
 
 
 def test_to_app_dict_unifies_system_package_shape():
@@ -986,3 +1052,33 @@ def test_app_tile_button_label_reflects_install_state():
     tile2 = AppTile(app, store)
     buttons2 = tile2.findChildren(QPushButton)
     assert buttons2[-1].text() == "Details"
+
+
+def test_details_page_show_app_does_not_leak_widgets_across_apps():
+    # Regression test: _lay.addLayout(header)/addLayout(actions) nest
+    # plain QLayouts, not QWidgets — a takeAt()-based clear() never finds
+    # a widget() on those items, so the action buttons inside them used to
+    # never get deleted and piled up, visibly overlapping, every time
+    # show_app() ran again for a different (or the same) app.
+    store = _bare_store()
+    store.config = {"username": "jan-tdy"}
+    store.installed = {"jan-tdy/repo/app1": {}, "jan-tdy/repo/app2": {}}
+    store.catalog = []
+    store.system_installed = {"apt": {}, "snap": {}, "flatpak": {}}
+    page = DetailsPage(store)
+
+    from PyQt5.QtWidgets import QPushButton
+    app1 = {"backend": "git", "key": "jan-tdy/repo/app1", "name": "App One",
+          "category": "Tools", "version": "1.0", "requirements": "req.txt"}
+    app2 = {"backend": "git", "key": "jan-tdy/repo/app2", "name": "App Two",
+          "category": "Tools", "version": "1.0", "requirements": "req.txt"}
+
+    page.show_app(app1)
+    count_1 = len(page.findChildren(QPushButton))
+    page.show_app(app2)
+    count_2 = len(page.findChildren(QPushButton))
+    page.show_app(app1)
+    count_3 = len(page.findChildren(QPushButton))
+
+    assert count_1 == count_2 == count_3
+    assert count_1 > 0
