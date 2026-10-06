@@ -127,7 +127,10 @@ class CodeMaster(QMainWindow):
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search apps…")
         self.search.setObjectName("Search")
-        self.search.textChanged.connect(self.refresh_views)
+        # Only the Store grid reads the search box (_matches_search is only
+        # used there) — wiring this to refresh_views() used to rebuild
+        # Installed/Updates/Manual too on every keystroke for nothing.
+        self.search.textChanged.connect(self.rebuild_store)
         lay.addWidget(self.search, 1)
 
         self.refresh_btn = QPushButton("⟳ Refresh")

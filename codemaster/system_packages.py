@@ -10,6 +10,7 @@ branch on ``app["backend"]``.
 import re
 import shutil
 import subprocess
+from pathlib import Path
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -80,10 +81,77 @@ class AptBackend:
     def available():
         return bool(shutil.which("apt-cache") and shutil.which("apt-get"))
 
+    DPKG_INFO_DIR = Path("/var/lib/dpkg/info")
+
+    @staticmethod
+    def _is_gui_desktop_entry(desktop_path):
+        """Whether a .desktop file describes something that belongs in a
+        graphical app store — not a CLI tool that merely ships a menu
+        entry (``Terminal=true``, e.g. python3.12.desktop or a JRE's
+        policy-tool launcher) and not an entry meant to stay out of menus
+        (``NoDisplay=true``/``Hidden=true``, common on exactly those same
+        interpreter/runtime packages)."""
+        try:
+            content = Path(desktop_path).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return False
+        in_entry = False
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if line.startswith("["):
+                in_entry = (line == "[Desktop Entry]")
+                continue
+            if not in_entry or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip().lower()
+            if key == "Type" and value != "application":
+                return False
+            if key in ("Terminal", "NoDisplay", "Hidden") and value == "true":
+                return False
+        return True
+
+    @staticmethod
+    def _installed_app_packages():
+        """Names of installed apt packages that ship a genuine GUI desktop
+        entry.
+
+        dpkg tracks every package on the system — base libraries, fonts,
+        kernel modules, thousands of them even on a minimal desktop — not
+        just applications, and plenty of those still drop a menu entry for
+        a command-line tool (python3.12, a JRE's policytool, ...). Reading
+        dpkg's own per-package file lists first (no subprocess per package)
+        keeps the common case fast; the handful of path hits that remain
+        are then checked against ``_is_gui_desktop_entry`` to drop the
+        terminal/hidden ones."""
+        if not AptBackend.DPKG_INFO_DIR.is_dir():
+            return set()
+        app_packages = set()
+        for list_file in AptBackend.DPKG_INFO_DIR.glob("*.list"):
+            # Multi-arch packages are named "<pkg>:<arch>.list".
+            pkg = list_file.stem.split(":", 1)[0]
+            try:
+                with open(list_file, "r", encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        path = line.rstrip()
+                        if "/share/applications/" in path and \
+                                path.endswith(".desktop") and \
+                                AptBackend._is_gui_desktop_entry(path):
+                            app_packages.add(pkg)
+                            break
+            except OSError:
+                continue
+        return app_packages
+
     @staticmethod
     def installed():
-        """{package: version} for every apt-installed package."""
+        """{package: version}, restricted to installed apt packages that
+        are actual applications (see ``_installed_app_packages``) — not
+        every one of the thousands of packages dpkg happens to track."""
         if not shutil.which("dpkg-query"):
+            return {}
+        app_packages = AptBackend._installed_app_packages()
+        if not app_packages:
             return {}
         try:
             out = _run(["dpkg-query", "-W", "-f=${Package}\\t${Version}\\n"])
@@ -91,8 +159,10 @@ class AptBackend:
             return {}
         result = {}
         for line in out.splitlines():
-            if "\t" in line:
-                pkg, version = line.split("\t", 1)
+            if "\t" not in line:
+                continue
+            pkg, version = line.split("\t", 1)
+            if pkg in app_packages:
                 result[pkg] = version
         return result
 
