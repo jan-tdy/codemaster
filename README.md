@@ -50,12 +50,14 @@ publishes the Telescope Cover, Astrofoto, Atacama (C14) and DSLR apps.
   dependencies when it declares a requirements file (tries
   `apt install python3-<package>` for each one first, falling back to
   `pip install --user` only for packages apt doesn't have).
-- **⟳ Updates** — installed git apps whose published version is newer than
-  the one you have are listed here; update them individually or all at
-  once. Code Master both **installs and updates** apps (`sync` apps via
-  `git pull`, `release` apps by fetching the latest release tag). APT/Snap/
-  Flatpak packages always show an **Update** button once installed instead
-  (their own package managers decide whether there's anything to do).
+- **⟳ Updates** — installed apps with a newer version available are listed
+  here; update them individually or all at once. Git apps: `sync` apps via
+  `git pull`, `release` apps by fetching the latest release tag. APT
+  (`apt list --upgradable`) and Snap (`snap refresh --list`) packages are
+  checked the same way, so they show up here too when there's a pending
+  update. Flatpak isn't probed — its **Update** button stays always
+  available once installed instead (its own package manager decides
+  whether there's anything to do).
 - **⚙ Manual & Settings** — register apps you installed **by hand** by
   pointing Code Master at a folder containing a `codemaster-metadata.json`
   file, and **remove** a registered location again (which also drops the

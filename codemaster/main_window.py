@@ -74,6 +74,7 @@ class CodeMaster(QMainWindow):
         # the background right after the window is up.
         self.catalog = load_catalog_cache()
         self.system_installed = {name: {} for name in BACKENDS}
+        self.system_upgradable = {name: set() for name in BACKENDS}
         self._system_search_results = {name: [] for name in BACKENDS}
         self._workers = set()
         self._self_commit = None
@@ -315,8 +316,9 @@ class CodeMaster(QMainWindow):
         self._workers.add(worker)
         worker.start()
 
-    def _on_system_installed_loaded(self, result):
-        self.system_installed = result
+    def _on_system_installed_loaded(self, installed, upgradable):
+        self.system_installed = installed
+        self.system_upgradable = upgradable
         self.refresh_views()
 
     # -- view rebuilding -------------------------------------------------- #
@@ -341,10 +343,12 @@ class CodeMaster(QMainWindow):
         apps = []
         seen = set()
         for backend_name in BACKENDS:
-            for pkg_id, version in self.system_installed.get(backend_name, {}).items():
+            for pkg_id, info in self.system_installed.get(backend_name, {}).items():
                 seen.add(f"{backend_name}:{pkg_id}")
-                apps.append(to_app_dict(backend_name, {"id": pkg_id, "name": pkg_id},
-                                        installed_version=version))
+                apps.append(to_app_dict(backend_name, {
+                    "id": pkg_id, "name": info.get("name", pkg_id),
+                    "icon_data": info.get("icon_data"),
+                }, installed_version=info.get("version", "")))
             if include_search:
                 for record in self._system_search_results.get(backend_name, []):
                     key = f"{backend_name}:{record['id']}"
@@ -446,10 +450,13 @@ class CodeMaster(QMainWindow):
         return str(app.get("version", ""))
 
     def has_update(self, app):
-        if app.get("backend", "git") != "git":
-            # Not probed for system packages — Update is always offered
-            # instead once installed (see DetailsPage._actions).
-            return False
+        backend = app.get("backend", "git")
+        if backend != "git":
+            # apt/snap are actually probed (InstalledScanWorker); flatpak
+            # isn't — its Update button stays always-available instead of
+            # pre-flagged (see FlatpakBackend.upgradable and
+            # DetailsPage._actions).
+            return app.get("pkg_id") in self.system_upgradable.get(backend, set())
         rec = self.installed.get(app["key"])
         if not rec:
             return False
@@ -763,10 +770,20 @@ class CodeMaster(QMainWindow):
                 QMessageBox.warning(self, f"{action.capitalize()} failed", msg)
                 return
             bucket = self.system_installed.setdefault(backend_name, {})
+            # Whatever just happened (installed, updated, or removed), the
+            # package can't still be "upgradable" — an actual rescan will
+            # confirm that properly, but clearing it now avoids it still
+            # showing up in Updates for the few minutes until the next one.
+            self.system_upgradable.setdefault(backend_name, set()).discard(pkg_id)
             if action == "remove":
                 bucket.pop(pkg_id, None)
             else:
-                bucket[pkg_id] = app.get("version", "")
+                # Good enough until the next full rescan: the tile that
+                # triggered this already carries whatever name/icon the
+                # search (or a previous scan) found for it.
+                bucket[pkg_id] = {"version": app.get("version", ""),
+                                  "name": app.get("name", pkg_id),
+                                  "icon_data": app.get("icon_data")}
             self.refresh_views()
             self._toast(f"{msg}: {app['name']}")
 

@@ -21,6 +21,21 @@ TILE_WIDTH = 220
 TILE_SPACING = 16
 
 
+def format_version(version):
+    """"1.5.0" -> "v1.5.0" for display — and "v1.5.0" (a release tag
+    already carrying the prefix, which is the usual GitHub tagging
+    convention) -> "v1.5.0", not "vv1.5.0". Strips at most one leading
+    v/V before adding the one we display, so it's a no-op either way."""
+    if not version:
+        return ""
+    version = str(version).strip()
+    if not version:
+        return ""
+    if version[0] in "vV":
+        version = version[1:]
+    return f"v{version}"
+
+
 # --------------------------------------------------------------------------- #
 #  Reflowing tile grid
 # --------------------------------------------------------------------------- #
@@ -146,7 +161,7 @@ class AppTile(QFrame):
         bits = [self.app.get("category", "")]
         version = self.controller.effective_version(self.app)
         if version:
-            bits.append("v" + version)
+            bits.append(format_version(version))
         return "  ·  ".join(b for b in bits if b)
 
     def _badge_text(self):
@@ -475,7 +490,7 @@ class DetailsPage(QScrollArea):
         bits = [app.get("category", "")]
         version = self.controller.effective_version(app)
         if version:
-            bits.append("v" + version)
+            bits.append(format_version(version))
         if app.get("backend") == "git":
             bits.append(f"{app.get('publisher')}/{app.get('repo')}")
             if app.get("private"):

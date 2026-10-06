@@ -21,7 +21,9 @@ from codemaster.catalog_loader import CatalogLoader  # noqa: E402
 from codemaster.git_worker import GitWorker, apt_package_name, apt_requirement_satisfied  # noqa: E402
 from codemaster.main_window import CodeMaster, app_source  # noqa: E402
 from codemaster.constants import APP_VERSION, xdg_data_home  # noqa: E402
-from codemaster.widgets import AppTile, CategorySidebar, DetailsPage, FilterBar  # noqa: E402
+from codemaster.widgets import (  # noqa: E402
+    AppTile, CategorySidebar, DetailsPage, FilterBar, format_version,
+)
 
 
 def _bare_store():
@@ -29,9 +31,18 @@ def _bare_store():
 
     Bypassing __init__ (and therefore QMainWindow.__init__) keeps most of
     these tests free of any real Qt platform/display dependency, since the
-    pure logic under test only touches plain attributes.
+    pure logic under test only touches plain attributes. Attributes a real
+    __init__ always sets (even when a given test's own scenario doesn't
+    care about them) get a harmless default here, so a test that never
+    touches e.g. system packages doesn't also have to stub them out.
     """
-    return CodeMaster.__new__(CodeMaster)
+    store = CodeMaster.__new__(CodeMaster)
+    store.config = {"username": "jan-tdy"}
+    store.installed = {}
+    store.catalog = []
+    store.system_installed = {"apt": {}, "snap": {}, "flatpak": {}}
+    store.system_upgradable = {"apt": set(), "snap": set(), "flatpak": set()}
+    return store
 
 
 # -- desktop entry helpers -------------------------------------------------- #
@@ -203,14 +214,24 @@ def test_has_update_returns_false_when_not_in_catalog():
     assert store.has_update({"key": "jan-tdy/repo/app", "backend": "git"}) is False
 
 
-def test_has_update_system_package_is_never_probed():
-    # Update availability for apt/snap/flatpak isn't checked up front — the
-    # Update button is always offered once installed instead (see
-    # DetailsPage._actions), so this must stay False regardless of state.
+def test_has_update_apt_and_snap_check_the_upgradable_set():
     store = _bare_store()
     store.installed = {}
     store.catalog = []
-    assert store.has_update({"backend": "apt", "pkg_id": "gimp"}) is False
+    store.system_upgradable = {"apt": {"gimp"}, "snap": set(), "flatpak": set()}
+    assert store.has_update({"backend": "apt", "pkg_id": "gimp"}) is True
+    assert store.has_update({"backend": "apt", "pkg_id": "vlc"}) is False
+    assert store.has_update({"backend": "snap", "pkg_id": "gimp"}) is False
+
+
+def test_flatpak_backend_upgradable_is_always_empty():
+    # Flatpak has no equally simple, version-stable "list pending updates"
+    # command to build on with confidence — has_update()'s dispatch for
+    # non-git backends is generic (membership in system_upgradable), so
+    # this guarantee lives here: an installed flatpak app's Update button
+    # stays always-available (see DetailsPage._actions) because this set
+    # is always empty, not because has_update() special-cases it.
+    assert system_packages.FlatpakBackend.upgradable() == set()
 
 
 # -- is_installed ---------------------------------------------------------------- #
@@ -356,12 +377,17 @@ def test_installed_apps_includes_installed_system_packages():
     store.config = {"username": "jan-tdy"}
     store.catalog = []
     store.installed = {}
-    store.system_installed = {"apt": {"gimp": "2.10.34"}, "snap": {}, "flatpak": {}}
+    store.system_installed = {
+        "apt": {"gimp": {"version": "2.10.34", "name": "GIMP", "icon_data": b"png"}},
+        "snap": {}, "flatpak": {},
+    }
     apps = store._installed_apps()
     assert len(apps) == 1
     assert apps[0]["backend"] == "apt"
     assert apps[0]["pkg_id"] == "gimp"
     assert apps[0]["version"] == "2.10.34"
+    assert apps[0]["name"] == "GIMP"
+    assert apps[0]["icon_data"] == b"png"
 
 
 # -- manual folder removal -------------------------------------------------- #
@@ -766,15 +792,32 @@ def test_raise_for_status_ignores_healthy_response():
 # -- CatalogLoader repo-scan skip cache --------------------------------------- #
 def test_catalog_loader_init_groups_cached_apps_by_repo():
     cached_apps = [
-        {"repo": "repo-a", "repo_pushed_at": "t1", "id": "app1"},
-        {"repo": "repo-a", "repo_pushed_at": "t1", "id": "app2"},
+        {"repo": "repo-a", "repo_pushed_at": "t1", "id": "app1", "publisher": "jan-tdy"},
+        {"repo": "repo-a", "repo_pushed_at": "t1", "id": "app2", "publisher": "jan-tdy"},
         # Pre-upgrade cache entries without repo_pushed_at are ignored,
         # not treated as a cache hit for an unscanned repo.
-        {"repo": "repo-b", "id": "app3"},
+        {"repo": "repo-b", "id": "app3", "publisher": "jan-tdy"},
     ]
     loader = CatalogLoader("jan-tdy", "main", "", cached_apps=cached_apps)
     assert set(loader._cache_by_repo.keys()) == {"repo-a"}
     assert len(loader._cache_by_repo["repo-a"]) == 2
+
+
+def test_catalog_loader_init_excludes_pre_v2_cache_entries_without_publisher():
+    # Regression test: a pre-v2 on-disk catalog.json has no "publisher"
+    # field and its apps carry the old two-segment "repo/id" key, which
+    # can never match an installed.json record migrated to
+    # "publisher/repo/id". Reusing such a stale entry from the cache
+    # (because the repo's pushed_at hasn't moved since the user's last v1
+    # scan) would keep every previously-installed app looking "not
+    # installed" forever — excluding it here forces one real rescan
+    # instead, which regenerates a correctly-keyed entry.
+    cached_apps = [
+        {"repo": "repo-a", "repo_pushed_at": "t1", "id": "app1"},  # no publisher
+    ]
+    loader = CatalogLoader("jan-tdy", "main", "", cached_apps=cached_apps)
+    assert loader._cache_by_repo == {}
+    assert loader._cached_apps_for("repo-a", "t1") is None
 
 
 def test_catalog_loader_init_groups_community_cache_by_file():
@@ -917,10 +960,56 @@ def test_apt_installed_parses_dpkg_query_tab_output(monkeypatch):
     monkeypatch.setattr(system_packages.shutil, "which", lambda name: "/usr/bin/dpkg-query")
     monkeypatch.setattr(system_packages.AptBackend, "_installed_app_packages",
                         staticmethod(lambda: {"gimp", "vlc"}))
+    monkeypatch.setattr(system_packages.AptBackend, "_desktop_entry_for_package",
+                        staticmethod(lambda pkg: None))
     monkeypatch.setattr(system_packages, "_run", lambda cmd, timeout=120:
                         "gimp\t2.10.34\nvlc\t3.0.20\nlibc6\t2.39\n")
-    assert system_packages.AptBackend.installed() == {"gimp": "2.10.34",
-                                                       "vlc": "3.0.20"}
+    assert system_packages.AptBackend.installed() == {
+        "gimp": {"version": "2.10.34", "name": "gimp", "icon_data": None},
+        "vlc": {"version": "3.0.20", "name": "vlc", "icon_data": None},
+    }
+
+
+def test_apt_installed_uses_desktop_entry_name_and_icon(monkeypatch):
+    # The actual complaint this fixes: apps that already have a nice name
+    # and icon via their own .desktop file used to show up with their bare
+    # dpkg package name and a lettered placeholder instead.
+    monkeypatch.setattr(system_packages.shutil, "which", lambda name: "/usr/bin/dpkg-query")
+    monkeypatch.setattr(system_packages.AptBackend, "_installed_app_packages",
+                        staticmethod(lambda: {"gimp"}))
+    monkeypatch.setattr(system_packages.AptBackend, "_desktop_entry_for_package",
+                        staticmethod(lambda pkg: {"name": "GIMP", "icon": "gimp"}))
+    monkeypatch.setattr(system_packages, "resolve_icon_bytes", lambda icon: b"icon-bytes")
+    monkeypatch.setattr(system_packages, "_run", lambda cmd, timeout=120: "gimp\t2.10.34\n")
+    assert system_packages.AptBackend.installed() == {
+        "gimp": {"version": "2.10.34", "name": "GIMP", "icon_data": b"icon-bytes"},
+    }
+
+
+def test_apt_upgradable_parses_apt_list_output(monkeypatch):
+    monkeypatch.setattr(system_packages, "_run", lambda cmd, timeout=120:
+                        "Listing...\n"
+                        "gimp/noble-updates 2.10.36-3 amd64 [upgradable from: 2.10.34-1]\n"
+                        "vlc/noble-updates 3.0.21-1 amd64 [upgradable from: 3.0.20-1]\n")
+    assert system_packages.AptBackend.upgradable() == {"gimp", "vlc"}
+
+
+def test_apt_upgradable_empty_when_nothing_pending(monkeypatch):
+    monkeypatch.setattr(system_packages, "_run", lambda cmd, timeout=120: "Listing...\n")
+    assert system_packages.AptBackend.upgradable() == set()
+
+
+def test_snap_upgradable_parses_refresh_list_table(monkeypatch):
+    out = ("Name   Version   Rev   Size   Publisher     Notes\n"
+           "gimp   2.10.36   315   169MB  snapcrafters*  -\n")
+    monkeypatch.setattr(system_packages, "_run", lambda cmd, timeout=120: out)
+    assert system_packages.SnapBackend.upgradable() == {"gimp"}
+
+
+def test_snap_upgradable_empty_when_all_up_to_date(monkeypatch):
+    monkeypatch.setattr(system_packages, "_run",
+                        lambda cmd, timeout=120: "All snaps up to date.\n")
+    assert system_packages.SnapBackend.upgradable() == set()
 
 
 def test_apt_installed_returns_nothing_without_desktop_apps(monkeypatch):
@@ -985,6 +1074,44 @@ def test_is_gui_desktop_entry_false_for_non_application_type(tmp_path):
 def test_is_gui_desktop_entry_false_for_missing_file(tmp_path):
     assert system_packages.AptBackend._is_gui_desktop_entry(
         tmp_path / "missing.desktop") is False
+
+
+def test_resolve_icon_bytes_reads_an_absolute_path(tmp_path):
+    icon_file = tmp_path / "icon.png"
+    icon_file.write_bytes(b"fake-png-bytes")
+    assert system_packages.resolve_icon_bytes(str(icon_file)) == b"fake-png-bytes"
+
+
+def test_resolve_icon_bytes_none_for_unresolvable_name():
+    assert system_packages.resolve_icon_bytes("a-name-no-theme-ships") is None
+
+
+def test_resolve_icon_bytes_none_for_empty_icon():
+    assert system_packages.resolve_icon_bytes(None) is None
+    assert system_packages.resolve_icon_bytes("") is None
+
+
+def test_snap_desktop_entry_matches_snapname_underscore_appname(tmp_path, monkeypatch):
+    monkeypatch.setattr(system_packages.SnapBackend, "SNAP_DESKTOP_DIR", tmp_path)
+    (tmp_path / "gimp_gimp.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=GIMP\nIcon=gimp\n",
+        encoding="utf-8")
+    entry = system_packages.SnapBackend._desktop_entry_for_snap("gimp")
+    assert entry == {"name": "GIMP", "icon": "gimp"}
+
+
+def test_snap_desktop_entry_none_when_no_launcher_matches(tmp_path, monkeypatch):
+    monkeypatch.setattr(system_packages.SnapBackend, "SNAP_DESKTOP_DIR", tmp_path)
+    assert system_packages.SnapBackend._desktop_entry_for_snap("gimp") is None
+
+
+def test_flatpak_desktop_entry_for_app_id_reads_export_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(system_packages.FlatpakBackend, "EXPORT_DESKTOP_DIRS", [tmp_path])
+    (tmp_path / "org.gimp.GIMP.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=GIMP\nIcon=org.gimp.GIMP\n",
+        encoding="utf-8")
+    entry = system_packages.FlatpakBackend._desktop_entry_for_app_id("org.gimp.GIMP")
+    assert entry == {"name": "GIMP", "icon": "org.gimp.GIMP"}
 
 
 def test_to_app_dict_unifies_system_package_shape():
@@ -1082,3 +1209,21 @@ def test_details_page_show_app_does_not_leak_widgets_across_apps():
 
     assert count_1 == count_2 == count_3
     assert count_1 > 0
+
+
+# -- version display -------------------------------------------------------- #
+def test_format_version_adds_v_prefix():
+    assert format_version("1.5.0") == "v1.5.0"
+
+
+def test_format_version_does_not_double_an_existing_v_prefix():
+    # Regression test: a release tag is conventionally already "v1.5.0",
+    # and effective_version() returns it verbatim — the display code used
+    # to blindly prepend another "v", showing "vv1.5.0".
+    assert format_version("v1.5.0") == "v1.5.0"
+    assert format_version("V1.5.0") == "v1.5.0"
+
+
+def test_format_version_empty_stays_empty():
+    assert format_version("") == ""
+    assert format_version(None) == ""
