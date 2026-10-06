@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "Jadiv Code Master"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.0-beta0"
 DEFAULT_USERNAME = "jan-tdy"
 DEFAULT_BRANCH = "main"
 METADATA_FILE = "codemaster-metadata.json"
