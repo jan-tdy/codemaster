@@ -34,7 +34,7 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Byte-compile
-        run: python -m py_compile jadiv_code_master.py
+        run: python -m compileall -q jadiv_code_master.py codemaster
 
       - name: Run tests
         env:
