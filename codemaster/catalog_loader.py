@@ -61,7 +61,16 @@ class CatalogLoader(QThread):
                     "apps": [],
                 })
                 entry["apps"].append(app)
-            elif app.get("repo_pushed_at") and app.get("repo"):
+            # A pre-v2 on-disk cache has no "publisher" field at all — its
+            # apps carry the old two-segment "repo/id" key, which can never
+            # match an installed.json record migrated to "publisher/repo/id".
+            # Excluding those from the reuse cache forces one real rescan
+            # per repo after the upgrade (same as a repo that's actually
+            # changed), which is what regenerates a correctly-keyed entry;
+            # reusing them verbatim would otherwise keep every previously
+            # installed app looking "not installed" forever, since a repo
+            # whose pushed_at hasn't moved is never rescanned again.
+            elif app.get("repo_pushed_at") and app.get("repo") and app.get("publisher"):
                 self._cache_by_repo.setdefault(app["repo"], []).append(app)
 
     # -- shared GitHub plumbing -------------------------------------- #

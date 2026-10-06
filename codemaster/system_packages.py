@@ -40,6 +40,94 @@ def _run(cmd, timeout=120):
     return proc.stdout
 
 
+# --------------------------------------------------------------------------- #
+#  .desktop file reading — the system already has nice names and icons for
+#  installed apt/snap/flatpak packages; this is how we actually use them
+#  instead of showing the bare package id with a lettered placeholder.
+# --------------------------------------------------------------------------- #
+ICON_THEME_DIRS = [
+    Path.home() / ".local/share/flatpak/exports/share/icons",
+    Path("/var/lib/flatpak/exports/share/icons"),
+    Path("/usr/share/icons"),
+    Path("/usr/local/share/icons"),
+]
+ICON_SIZE_DIRS = ["scalable", "256x256", "192x192", "128x128", "96x96",
+                 "64x64", "48x48", "32x32"]
+PIXMAP_DIRS = [
+    Path.home() / ".local/share/flatpak/exports/share/pixmaps",
+    Path("/var/lib/flatpak/exports/share/pixmaps"),
+    Path("/usr/share/pixmaps"),
+]
+
+
+def _resolve_icon_path(icon):
+    """A themed icon name (or an already-absolute path) -> an actual file
+    on disk, searching the usual freedesktop icon-theme and pixmap
+    locations (plus Flatpak's own per-user/system export dirs). Prefers
+    vector/large sizes first for quality."""
+    if not icon:
+        return None
+    direct = Path(icon)
+    if direct.is_absolute():
+        return direct if direct.exists() else None
+    for base in ICON_THEME_DIRS:
+        for size in ICON_SIZE_DIRS:
+            for ext in ("svg", "png", "xpm"):
+                candidate = base / "hicolor" / size / "apps" / f"{icon}.{ext}"
+                if candidate.exists():
+                    return candidate
+    for base in PIXMAP_DIRS:
+        for ext in ("png", "svg", "xpm"):
+            candidate = base / f"{icon}.{ext}"
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def resolve_icon_bytes(icon):
+    path = _resolve_icon_path(icon)
+    if not path:
+        return None
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def parse_desktop_entry(desktop_path):
+    """{"name", "icon"} for a .desktop file, or None if it isn't a
+    displayable GUI application: wrong Type, or Terminal=/NoDisplay=/
+    Hidden=true — the same signal that marks e.g. python3.12.desktop or a
+    JRE's policytool launcher as "has a menu entry but isn't really an
+    app" rather than something that belongs in an app store."""
+    try:
+        content = Path(desktop_path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    in_entry = False
+    name = icon = None
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if line.startswith("["):
+            in_entry = (line == "[Desktop Entry]")
+            continue
+        if not in_entry or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if key == "Type" and value.lower() != "application":
+            return None
+        if key in ("Terminal", "NoDisplay", "Hidden") and value.lower() == "true":
+            return None
+        if key == "Name" and name is None:
+            name = value
+        elif key == "Icon" and icon is None:
+            icon = value
+    if name is None:
+        return None
+    return {"name": name, "icon": icon}
+
+
 def _parse_table(output):
     """Parse a whitespace-column CLI table (the format ``snap``/``flatpak``
     print) into a list of {header: value} dicts, using the header row's
@@ -91,25 +179,37 @@ class AptBackend:
         policy-tool launcher) and not an entry meant to stay out of menus
         (``NoDisplay=true``/``Hidden=true``, common on exactly those same
         interpreter/runtime packages)."""
+        return parse_desktop_entry(desktop_path) is not None
+
+    @staticmethod
+    def _desktop_paths_for_package(list_file):
+        """Every ``share/applications/*.desktop`` path a package's dpkg
+        file list mentions, in listed order."""
         try:
-            content = Path(desktop_path).read_text(encoding="utf-8", errors="ignore")
+            with open(list_file, "r", encoding="utf-8", errors="ignore") as fh:
+                return [line.rstrip() for line in fh
+                       if "/share/applications/" in line and
+                       line.rstrip().endswith(".desktop")]
         except OSError:
-            return False
-        in_entry = False
-        for raw_line in content.splitlines():
-            line = raw_line.strip()
-            if line.startswith("["):
-                in_entry = (line == "[Desktop Entry]")
-                continue
-            if not in_entry or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key, value = key.strip(), value.strip().lower()
-            if key == "Type" and value != "application":
-                return False
-            if key in ("Terminal", "NoDisplay", "Hidden") and value == "true":
-                return False
-        return True
+            return []
+
+    @staticmethod
+    def _desktop_entry_for_package(pkg):
+        """The first real GUI {"name", "icon"} entry ``pkg`` ships, or
+        None — used to show the package's actual application name/icon
+        instead of its bare dpkg name and a lettered placeholder."""
+        list_file = AptBackend.DPKG_INFO_DIR / f"{pkg}.list"
+        if not list_file.exists():
+            # Multi-arch packages are named "<pkg>:<arch>.list".
+            matches = sorted(AptBackend.DPKG_INFO_DIR.glob(f"{pkg}:*.list"))
+            if not matches:
+                return None
+            list_file = matches[0]
+        for path in AptBackend._desktop_paths_for_package(list_file):
+            entry = parse_desktop_entry(path)
+            if entry:
+                return entry
+        return None
 
     @staticmethod
     def _installed_app_packages():
@@ -130,24 +230,19 @@ class AptBackend:
         for list_file in AptBackend.DPKG_INFO_DIR.glob("*.list"):
             # Multi-arch packages are named "<pkg>:<arch>.list".
             pkg = list_file.stem.split(":", 1)[0]
-            try:
-                with open(list_file, "r", encoding="utf-8", errors="ignore") as fh:
-                    for line in fh:
-                        path = line.rstrip()
-                        if "/share/applications/" in path and \
-                                path.endswith(".desktop") and \
-                                AptBackend._is_gui_desktop_entry(path):
-                            app_packages.add(pkg)
-                            break
-            except OSError:
-                continue
+            if any(AptBackend._is_gui_desktop_entry(path) for path in
+                  AptBackend._desktop_paths_for_package(list_file)):
+                app_packages.add(pkg)
         return app_packages
 
     @staticmethod
     def installed():
-        """{package: version}, restricted to installed apt packages that
-        are actual applications (see ``_installed_app_packages``) — not
-        every one of the thousands of packages dpkg happens to track."""
+        """{package: {"version", "name", "icon_data"}}, restricted to
+        installed apt packages that are actual applications (see
+        ``_installed_app_packages``) — not every one of the thousands of
+        packages dpkg happens to track. name/icon_data come from the
+        package's own .desktop entry when it has one, the same name and
+        icon its application-menu launcher already shows."""
         if not shutil.which("dpkg-query"):
             return {}
         app_packages = AptBackend._installed_app_packages()
@@ -162,8 +257,14 @@ class AptBackend:
             if "\t" not in line:
                 continue
             pkg, version = line.split("\t", 1)
-            if pkg in app_packages:
-                result[pkg] = version
+            if pkg not in app_packages:
+                continue
+            entry = AptBackend._desktop_entry_for_package(pkg) or {}
+            result[pkg] = {
+                "version": version,
+                "name": entry.get("name") or pkg,
+                "icon_data": resolve_icon_bytes(entry.get("icon")),
+            }
         return result
 
     @staticmethod
@@ -182,6 +283,26 @@ class AptBackend:
             if len(results) >= MAX_SEARCH_RESULTS:
                 break
         return results
+
+    @staticmethod
+    def upgradable():
+        """Names of installed apt packages with a pending update.
+
+        ``apt list --upgradable`` prints lines like
+        "python3/noble-updates 3.12.3-1 amd64 [upgradable from: 3.12.2-1]"
+        (plus a "Listing..." line and, on stderr only, apt's own "not a
+        stable CLI interface" warning — never on stdout, so it never ends
+        up in ``out`` here)."""
+        try:
+            out = _run(["apt", "list", "--upgradable"])
+        except RuntimeError:
+            return set()
+        names = set()
+        for line in out.splitlines():
+            if "/" not in line:
+                continue
+            names.add(line.split("/", 1)[0].strip())
+        return names
 
     @staticmethod
     def install(pkg):
@@ -233,14 +354,43 @@ class SnapBackend:
     def available():
         return bool(shutil.which("snap"))
 
+    SNAP_DESKTOP_DIR = Path("/var/lib/snapd/desktop/applications")
+
+    @staticmethod
+    def _desktop_entry_for_snap(name):
+        """snapd generates a .desktop launcher per app a snap exposes,
+        named "<snap>_<app>.desktop" (or just "<snap>.desktop" when the
+        snap's main app shares its name) — look for one so an installed
+        snap shows the same name/icon its own launcher does, instead of
+        its bare snap id and a lettered placeholder."""
+        if not SnapBackend.SNAP_DESKTOP_DIR.is_dir():
+            return None
+        candidates = sorted(SnapBackend.SNAP_DESKTOP_DIR.glob(f"{name}.desktop")) + \
+            sorted(SnapBackend.SNAP_DESKTOP_DIR.glob(f"{name}_*.desktop"))
+        for path in candidates:
+            entry = parse_desktop_entry(path)
+            if entry:
+                return entry
+        return None
+
     @staticmethod
     def installed():
         try:
             out = _run(["snap", "list"])
         except RuntimeError:
             return {}
-        return {row.get("Name", ""): row.get("Version", "")
-                for row in _parse_table(out) if row.get("Name")}
+        result = {}
+        for row in _parse_table(out):
+            name = row.get("Name")
+            if not name:
+                continue
+            entry = SnapBackend._desktop_entry_for_snap(name) or {}
+            result[name] = {
+                "version": row.get("Version", ""),
+                "name": entry.get("name") or name,
+                "icon_data": resolve_icon_bytes(entry.get("icon")),
+            }
+        return result
 
     @staticmethod
     def search(query):
@@ -260,6 +410,18 @@ class SnapBackend:
             if len(results) >= MAX_SEARCH_RESULTS:
                 break
         return results
+
+    @staticmethod
+    def upgradable():
+        """Names of installed snaps with a pending refresh. ``snap
+        refresh --list`` prints a table of refreshable snaps, or a single
+        "All snaps up to date." line (no real table, parses to no rows)
+        when there's nothing to do — needs no root to just check."""
+        try:
+            out = _run(["snap", "refresh", "--list"])
+        except RuntimeError:
+            return set()
+        return {row["Name"] for row in _parse_table(out) if row.get("Name")}
 
     @staticmethod
     def install(name):
@@ -313,6 +475,23 @@ class FlatpakBackend:
         except RuntimeError:
             pass  # best-effort: search/install will just come back empty
 
+    EXPORT_DESKTOP_DIRS = [
+        Path.home() / ".local/share/flatpak/exports/share/applications",
+        Path("/var/lib/flatpak/exports/share/applications"),
+    ]
+
+    @staticmethod
+    def _desktop_entry_for_app_id(app_id):
+        """Flatpak exports a "<app-id>.desktop" launcher for every
+        installed app (user-scoped, since installs here always use
+        ``--user``, but system-wide installs are checked too) — reading
+        its Icon= gets the icon flatpak list's own columns don't carry."""
+        for base in FlatpakBackend.EXPORT_DESKTOP_DIRS:
+            entry = parse_desktop_entry(base / f"{app_id}.desktop")
+            if entry:
+                return entry
+        return None
+
     @staticmethod
     def installed():
         try:
@@ -322,8 +501,17 @@ class FlatpakBackend:
         result = {}
         for row in _parse_table(out):
             app_id = row.get("Application ID", "")
-            if app_id:
-                result[app_id] = row.get("Version", "")
+            if not app_id:
+                continue
+            entry = FlatpakBackend._desktop_entry_for_app_id(app_id) or {}
+            result[app_id] = {
+                "version": row.get("Version", ""),
+                # flatpak list's own "Name" column is already the nice
+                # display name (e.g. "GIMP", not "org.gimp.GIMP") —
+                # prefer it, the exported .desktop's Name= as a fallback.
+                "name": row.get("Name") or entry.get("name") or app_id,
+                "icon_data": resolve_icon_bytes(entry.get("icon") or app_id),
+            }
         return result
 
     @staticmethod
@@ -346,6 +534,16 @@ class FlatpakBackend:
             if len(results) >= MAX_SEARCH_RESULTS:
                 break
         return results
+
+    @staticmethod
+    def upgradable():
+        # Not probed, unlike apt/snap: flatpak has no equally simple,
+        # version-stable "list pending updates without applying them"
+        # command to build on with confidence. The Update button stays
+        # always-available for installed flatpak apps instead (see
+        # DetailsPage._actions) — running it is still correct, just not
+        # pre-flagged here.
+        return set()
 
     @staticmethod
     def install(app_id):
@@ -407,7 +605,7 @@ def to_app_dict(backend_name, record, installed_version=None):
         "category": f"{backend.label} packages",
         "version": installed_version or record.get("version", ""),
         "author": backend.label,
-        "icon_data": None,
+        "icon_data": record.get("icon_data"),
         "homepage": homepage,
         "maintained": True,
         "private": False,
@@ -447,22 +645,30 @@ class SystemPackageWorker(QThread):
 
 
 class InstalledScanWorker(QThread):
-    """Collects {backend_name: {pkg_id: version}} for every available
-    backend, off the UI thread — dpkg-query/snap list/flatpak list are
-    fast individually but still worth keeping off a UI that just started."""
-    loaded = pyqtSignal(dict)
+    """Collects {backend_name: {pkg_id: version}} and {backend_name:
+    {pkg_id with a pending update}} for every available backend, off the
+    UI thread — dpkg-query/snap list/flatpak list (and the upgradable
+    checks) are fast individually but still worth keeping off a UI that
+    just started."""
+    loaded = pyqtSignal(dict, dict)  # installed, upgradable
 
     def run(self):
-        result = {}
+        installed = {}
+        upgradable = {}
         for name, backend in BACKENDS.items():
-            if backend.available():
-                try:
-                    result[name] = backend.installed()
-                except Exception:  # noqa: BLE001
-                    result[name] = {}
-            else:
-                result[name] = {}
-        self.loaded.emit(result)
+            if not backend.available():
+                installed[name] = {}
+                upgradable[name] = set()
+                continue
+            try:
+                installed[name] = backend.installed()
+            except Exception:  # noqa: BLE001
+                installed[name] = {}
+            try:
+                upgradable[name] = backend.upgradable()
+            except Exception:  # noqa: BLE001
+                upgradable[name] = set()
+        self.loaded.emit(installed, upgradable)
 
 
 class PackageSearchWorker(QThread):
