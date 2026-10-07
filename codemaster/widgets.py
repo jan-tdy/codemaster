@@ -171,10 +171,18 @@ class AppTile(QFrame):
         lay.addStretch()
 
         installed = self.controller.is_installed(self.app)
-        btn = QPushButton("Details" if installed else "Install")
+        # Busy only blocks the mutating "Install" action — "Details" stays
+        # clickable on an installed app so the user can still get to the
+        # details page (its own action buttons are disabled individually).
+        busy = not installed and self.controller.is_busy(self.app)
+        btn = QPushButton("Installing…" if busy else
+                          ("Details" if installed else "Install"))
         btn.setObjectName("Primary" if not installed else "Ghost")
         btn.setCursor(Qt.PointingHandCursor)
-        btn.clicked.connect(self._on_button)
+        if busy:
+            btn.setEnabled(False)
+        else:
+            btn.clicked.connect(self._on_button)
         lay.addWidget(btn)
 
     def _meta_text(self):
@@ -476,11 +484,18 @@ class DetailsPage(QScrollArea):
         self._lay.addLayout(header)
 
         actions = QHBoxLayout()
-        for label, kind, slot in self._actions():
+        busy = self.controller.is_busy(app)
+        for label, kind, slot, mutating in self._actions():
             btn = QPushButton(label)
             btn.setObjectName(kind)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda _=None, s=slot: s(self.app))
+            # A mutating action (install/update/remove/install deps) is
+            # disabled while a GitWorker is already touching this app's
+            # clone, instead of letting a second one race it.
+            if mutating and busy:
+                btn.setEnabled(False)
+            else:
+                btn.clicked.connect(lambda _=None, s=slot: s(self.app))
             actions.addWidget(btn)
         actions.addStretch()
         self._lay.addLayout(actions)
@@ -526,16 +541,18 @@ class DetailsPage(QScrollArea):
         return "  ·  ".join(b for b in bits if b)
 
     def _actions(self):
-        """(label, button-style-id, controller-method) for every button
-        this app's state calls for."""
+        """(label, button-style-id, controller-method, mutating) for every
+        button this app's state calls for. ``mutating`` marks an action
+        that starts (or needs) a GitWorker on this app's clone — those are
+        the ones disabled while is_busy(app) is true."""
         app = self.app
         c = self.controller
         installed = c.is_installed(app)
         actions = []
         if not installed:
-            actions.append(("Install", "Primary", c.install_app))
+            actions.append(("Install", "Primary", c.install_app, True))
             if app.get("homepage"):
-                actions.append(("Open homepage", "Ghost", c.open_homepage))
+                actions.append(("Open homepage", "Ghost", c.open_homepage, False))
             return actions
         # Flatpak updates aren't probed (FlatpakBackend.upgradable() is
         # always empty — see its docstring), so has_update() is always
@@ -544,19 +561,19 @@ class DetailsPage(QScrollArea):
         # nothing to do.
         show_update = c.has_update(app) or app.get("backend") == "flatpak"
         if show_update:
-            actions.append(("Update", "Primary", c.update_app))
+            actions.append(("Update", "Primary", c.update_app, True))
         actions.append(("Open", "Primary" if not show_update else "Ghost",
-                        c.launch_app))
+                        c.launch_app, False))
         if app.get("backend") == "git":
             if c.has_launcher(app):
-                actions.append(("Remove launcher", "Ghost", c.remove_launcher))
+                actions.append(("Remove launcher", "Ghost", c.remove_launcher, False))
             else:
-                actions.append(("Add to menu", "Ghost", c.create_launcher))
+                actions.append(("Add to menu", "Ghost", c.create_launcher, False))
             if app.get("requirements"):
-                actions.append(("Install deps", "Ghost", c.install_deps))
-        actions.append(("Remove", "Ghost", c.uninstall_app))
+                actions.append(("Install deps", "Ghost", c.install_deps, True))
+        actions.append(("Remove", "Ghost", c.uninstall_app, True))
         if app.get("homepage"):
-            actions.append(("Homepage", "Ghost", c.open_homepage))
+            actions.append(("Homepage", "Ghost", c.open_homepage, False))
         return actions
 
     def _load_readme(self, app):
