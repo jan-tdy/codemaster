@@ -77,6 +77,12 @@ class CodeMaster(QMainWindow):
         self.system_upgradable = {name: set() for name in BACKENDS}
         self._system_search_results = {name: [] for name in BACKENDS}
         self._workers = set()
+        # Keys (str(repo_root)) with a GitWorker currently cloning/pulling/
+        # installing deps into them — guards against a second click (or a
+        # Remove) racing a running git operation on the same clone. Several
+        # app keys can share one repo_root, so this is keyed on the clone
+        # path itself, not the app key.
+        self._busy = set()
         self._self_commit = None
 
         central = QWidget()
@@ -557,6 +563,16 @@ class CodeMaster(QMainWindow):
         publisher = app.get("publisher", self.config["username"])
         return APPS_DIR / publisher / app.get("repo", "")
 
+    def is_busy(self, app):
+        """Whether a GitWorker is currently cloning/pulling/installing deps
+        into this app's clone — used to keep Install/Update/Remove/Install
+        deps disabled while one runs, so a second click (possibly from a
+        different tab's tile for the same repo) can't start a second git
+        operation on the same directory."""
+        if app.get("backend", "git") != "git":
+            return False
+        return str(self._repo_root(app)) in self._busy
+
     def open_details(self, app):
         resolved = self._resolve(app) if app.get("backend", "git") == "git" else app
         self.details_page.show_app(resolved)
@@ -570,6 +586,11 @@ class CodeMaster(QMainWindow):
             return
         publisher = app.get("publisher", self.config["username"])
         repo_root = APPS_DIR / publisher / app["repo"]
+        busy_key = str(repo_root)
+        if busy_key in self._busy:
+            self._toast(f"{app['name']} already has an operation in progress")
+            return
+        self._busy.add(busy_key)
         worker = GitWorker("install", publisher, app["repo"], repo_root,
                            app.get("branch", self.config["branch"]),
                            method=app.get("update_method", "sync"),
@@ -578,8 +599,10 @@ class CodeMaster(QMainWindow):
 
         def finished(ok, msg, commit=""):
             self._workers.discard(worker)
+            self._busy.discard(busy_key)
             if not ok:
                 QMessageBox.warning(self, "Install failed", msg)
+                self.refresh_views()
                 return
             self.installed[app["key"]] = {
                 "name": app["name"], "repo": app["repo"],
@@ -605,6 +628,7 @@ class CodeMaster(QMainWindow):
         worker.done.connect(finished)
         self._workers.add(worker)
         worker.start()
+        self.refresh_views()
         self._toast(f"Installing {app['name']}…")
 
     def update_app(self, app):
@@ -613,6 +637,11 @@ class CodeMaster(QMainWindow):
             return
         app = self._resolve(app)
         repo_root = self._repo_root(app)
+        busy_key = str(repo_root)
+        if busy_key in self._busy:
+            self._toast(f"{app['name']} already has an operation in progress")
+            return
+        self._busy.add(busy_key)
         publisher = app.get("publisher", self.config["username"])
         catalog = next((a for a in self.catalog if a["key"] == app["key"]),
                        None) or app
@@ -624,8 +653,10 @@ class CodeMaster(QMainWindow):
 
         def finished(ok, msg, commit=""):
             self._workers.discard(worker)
+            self._busy.discard(busy_key)
             if not ok:
                 QMessageBox.warning(self, "Update failed", msg)
+                self.refresh_views()
                 return
             # Refreshing the clone updates every installed app from this repo —
             # sync each one's stored version to the freshly installed one.
@@ -652,6 +683,7 @@ class CodeMaster(QMainWindow):
         worker.done.connect(finished)
         self._workers.add(worker)
         worker.start()
+        self.refresh_views()
         self._toast(f"Updating {app['name']}…")
 
     def install_deps(self, app):
@@ -662,12 +694,19 @@ class CodeMaster(QMainWindow):
             QMessageBox.warning(self, "Dependencies",
                                 f"Requirements file not found:\n{req}")
             return
+        busy_key = str(repo_root)
+        if busy_key in self._busy:
+            self._toast(f"{app['name']} already has an operation in progress")
+            return
+        self._busy.add(busy_key)
         publisher = app.get("publisher", self.config["username"])
         worker = GitWorker("deps", publisher, app["repo"],
                            repo_root, app.get("branch"), req_path=req)
 
         def finished(ok, msg, _commit=""):
             self._workers.discard(worker)
+            self._busy.discard(busy_key)
+            self.refresh_views()
             QMessageBox.information(
                 self, "Dependencies",
                 msg if ok else f"Failed to install dependencies:\n{msg}")
@@ -675,6 +714,7 @@ class CodeMaster(QMainWindow):
         worker.done.connect(finished)
         self._workers.add(worker)
         worker.start()
+        self.refresh_views()
         self._toast(f"Installing dependencies for {app['name']}…")
 
     def launch_app(self, app):
@@ -928,6 +968,13 @@ class CodeMaster(QMainWindow):
                 return
             self._run_system_worker("remove", app, f"Removing {app['name']}…")
             return
+        if self.is_busy(app):
+            QMessageBox.warning(
+                self, "Remove app",
+                f"{app.get('name', app.get('key'))} has an install or "
+                "update in progress — wait for it to finish before "
+                "removing it.")
+            return
         confirm = QMessageBox.question(
             self, "Remove app",
             f"Remove {app['name']} from your installed apps?")
@@ -1164,6 +1211,11 @@ class CodeMaster(QMainWindow):
                 "Code Master isn't running from a git checkout, so it can't "
                 f"update itself automatically.\n\nLocation:\n{SELF_DIR}")
             return
+        busy_key = str(SELF_DIR)
+        if busy_key in self._busy:
+            self._toast("Code Master is already updating…")
+            return
+        self._busy.add(busy_key)
         entry = self._self_catalog_entry()
         branch = entry.get("branch") if entry else None
         worker = GitWorker("update", DEFAULT_USERNAME, "codemaster",
@@ -1173,6 +1225,7 @@ class CodeMaster(QMainWindow):
 
         def finished(ok, msg, _commit=""):
             self._workers.discard(worker)
+            self._busy.discard(busy_key)
             self.self_update_btn.setText("Update Code Master")
             self.self_update_btn.setEnabled(True)
             if not ok:
@@ -1192,6 +1245,39 @@ class CodeMaster(QMainWindow):
     # -- misc ------------------------------------------------------------- #
     def _toast(self, message):
         self.statusBar().showMessage(message, 4000)
+
+    def closeEvent(self, event):
+        """Don't let Qt tear down a live GitWorker/CatalogLoader mid-
+        operation — killing a thread mid `git clone`/`pull` (or mid pip
+        install) can leave a clone half-written, and Qt itself warns
+        "QThread: Destroyed while thread is still running" when a QThread
+        is deleted while running. Give the user the choice to wait for
+        in-flight work before the window actually closes."""
+        running = [w for w in self._workers if w.isRunning()]
+        if not running:
+            super().closeEvent(event)
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Operations in progress")
+        box.setText(
+            f"{len(running)} background operation(s) (install/update/"
+            "dependency/catalog scan) are still running. Closing now "
+            "could interrupt a git clone or pull mid-write.")
+        wait_btn = box.addButton("Wait, then close", QMessageBox.AcceptRole)
+        close_btn = box.addButton("Close now", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(wait_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is close_btn:
+            event.accept()
+            return
+        if clicked is not wait_btn:
+            event.ignore()
+            return
+        for worker in running:
+            worker.wait(10000)
+        event.accept()
 
 
 def main():

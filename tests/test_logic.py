@@ -42,6 +42,7 @@ def _bare_store():
     store.catalog = []
     store.system_installed = {"apt": {}, "snap": {}, "flatpak": {}}
     store.system_upgradable = {"apt": set(), "snap": set(), "flatpak": set()}
+    store._busy = set()
     return store
 
 
@@ -1197,6 +1198,182 @@ def test_app_tile_button_label_reflects_install_state():
     tile2 = AppTile(app, store)
     buttons2 = tile2.findChildren(QPushButton)
     assert buttons2[-1].text() == "Details"
+
+
+def test_is_busy_true_when_repo_root_has_a_running_git_worker():
+    store = _bare_store()
+    store.installed = {"jan-tdy/repo/app": {"repo_root": "/apps/jan-tdy/repo"}}
+    app = {"key": "jan-tdy/repo/app", "backend": "git", "repo": "repo"}
+    assert store.is_busy(app) is False
+    store._busy.add("/apps/jan-tdy/repo")
+    assert store.is_busy(app) is True
+
+
+def test_is_busy_is_false_for_system_packages_even_if_key_collides():
+    # is_busy() only ever guards git clones — a "git" and non-git app could
+    # otherwise alias the same busy-set key by coincidence.
+    store = _bare_store()
+    store._busy.add("/apps/jan-tdy/repo")
+    app = {"backend": "apt", "pkg_id": "/apps/jan-tdy/repo"}
+    assert store.is_busy(app) is False
+
+
+def test_app_tile_disables_install_button_while_repo_is_busy():
+    store = _bare_store()
+    store.installed = {}
+    store.config = {"username": "jan-tdy"}
+    app = {"key": "jan-tdy/repo/app", "backend": "git", "name": "App",
+          "category": "Tools", "version": "1.0", "repo": "repo",
+          "publisher": "jan-tdy"}
+    # Same path install_app()/is_busy() would compute for this app.
+    from codemaster.constants import APPS_DIR
+    store._busy.add(str(APPS_DIR / "jan-tdy" / "repo"))
+
+    from PyQt5.QtWidgets import QPushButton
+    tile = AppTile(app, store)
+    btn = tile.findChildren(QPushButton)[-1]
+    assert btn.text() == "Installing…"
+    assert not btn.isEnabled()
+
+
+def test_details_page_disables_only_mutating_actions_while_busy(monkeypatch):
+    def no_network(*_a, **_kw):
+        raise requests.RequestException("no network in tests")
+    monkeypatch.setattr("codemaster.widgets.requests.get", no_network)
+
+    store = _bare_store()
+    store.config = {"username": "jan-tdy"}
+    repo_root = "/apps/jan-tdy/repo"
+    store.installed = {"jan-tdy/repo/app": {"repo_root": repo_root,
+                                             "commit": "old123"}}
+    # A catalog entry with a newer commit so has_update() offers "Update"
+    # (and its button can be asserted disabled below).
+    store.catalog = [{"key": "jan-tdy/repo/app", "latest_commit": "new456"}]
+    store._busy.add(repo_root)
+    page = DetailsPage(store)
+
+    from PyQt5.QtWidgets import QPushButton
+    app = {"backend": "git", "key": "jan-tdy/repo/app", "name": "App",
+          "category": "Tools", "version": "1.0", "requirements": "req.txt"}
+    page.show_app(app)
+
+    by_text = {btn.text(): btn for btn in page.findChildren(QPushButton)}
+    # Mutating actions (would start a second GitWorker on the same clone,
+    # or delete it out from under the one already running) stay disabled.
+    assert not by_text["Update"].isEnabled()
+    assert not by_text["Install deps"].isEnabled()
+    assert not by_text["Remove"].isEnabled()
+    # Non-mutating actions are unaffected.
+    assert by_text["Open"].isEnabled()
+    assert by_text["Add to menu"].isEnabled()
+
+
+class _FakeCloseEvent:
+    def __init__(self):
+        self.accepted = False
+        self.ignored = False
+
+    def accept(self):
+        self.accepted = True
+
+    def ignore(self):
+        self.ignored = True
+
+
+class _FakeWorker:
+    def __init__(self):
+        self.waited_ms = None
+
+    def isRunning(self):
+        return True
+
+    def wait(self, timeout_ms):
+        self.waited_ms = timeout_ms
+
+
+def _fake_message_box(monkeypatch, clicked_name):
+    """Stub out QMessageBox so closeEvent()'s dialog never actually pops
+    up (and blocks) during the test — ``clicked_name`` picks which of the
+    three buttons the simulated user clicks: "wait", "close", or
+    "cancel"."""
+    buttons = {}
+
+    class FakeBox:
+        AcceptRole = "AcceptRole"
+        DestructiveRole = "DestructiveRole"
+        Cancel = "Cancel"
+
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def setWindowTitle(self, *_a):
+            pass
+
+        def setText(self, *_a):
+            pass
+
+        def addButton(self, *args):
+            label = args[0]
+            btn = object()
+            if label == "Wait, then close":
+                buttons["wait"] = btn
+            elif label == "Close now":
+                buttons["close"] = btn
+            else:
+                buttons["cancel"] = btn
+            return btn
+
+        def setDefaultButton(self, *_a):
+            pass
+
+        def exec_(self):
+            pass
+
+        def clickedButton(self):
+            return buttons[clicked_name]
+
+    monkeypatch.setattr("codemaster.main_window.QMessageBox", FakeBox)
+
+
+def test_close_event_waits_for_running_workers_then_closes(monkeypatch):
+    _fake_message_box(monkeypatch, "wait")
+    store = _bare_store()
+    worker = _FakeWorker()
+    store._workers = {worker}
+    event = _FakeCloseEvent()
+
+    store.closeEvent(event)
+
+    assert worker.waited_ms is not None
+    assert event.accepted is True
+    assert event.ignored is False
+
+
+def test_close_event_close_now_skips_waiting(monkeypatch):
+    _fake_message_box(monkeypatch, "close")
+    store = _bare_store()
+    worker = _FakeWorker()
+    store._workers = {worker}
+    event = _FakeCloseEvent()
+
+    store.closeEvent(event)
+
+    assert worker.waited_ms is None
+    assert event.accepted is True
+
+
+def test_close_event_cancel_leaves_window_open(monkeypatch):
+    _fake_message_box(monkeypatch, "cancel")
+    store = _bare_store()
+    worker = _FakeWorker()
+    store._workers = {worker}
+    event = _FakeCloseEvent()
+
+    store.closeEvent(event)
+
+    assert worker.waited_ms is None
+    assert event.accepted is False
+    assert event.ignored is True
 
 
 def test_details_page_show_app_does_not_leak_widgets_across_apps(monkeypatch):
