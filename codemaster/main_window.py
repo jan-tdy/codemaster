@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
     QApplication, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QMessageBox, QPushButton, QStackedWidget,
@@ -1335,6 +1336,19 @@ class CodeMaster(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    # Without these, a window opened by plain "python3 jadiv_code_master.py"
+    # (as the installed .desktop launcher's Exec= does) carries no icon
+    # hint at all: Qt never sets one on its own, and on Wayland/GNOME the
+    # dock/taskbar matches a running window to its icon via the XDG desktop
+    # file id (setDesktopFileName, matching the installed codemaster.desktop)
+    # rather than X11 WM_CLASS, so without it the dock falls back to a
+    # generic placeholder icon. setWindowIcon covers X11 desktops and acts
+    # as a fallback wherever the desktop-file match doesn't apply.
+    app.setDesktopFileName("codemaster")
+    icon_path = SELF_DIR / "assets" / "codemaster.svg"
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     window = CodeMaster()
     window.show()
     sys.exit(app.exec_())
