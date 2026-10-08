@@ -132,6 +132,17 @@ class CodeMaster(QMainWindow):
         self.tabs.addTab(self._build_manual_tab(), "Manual & Settings")
 
         self.setStyleSheet(STYLE)
+        # Deferred to the event loop's first idle tick instead of run here:
+        # __init__ must return — and main() must get to call window.show()
+        # right after constructing it — before any of this runs, or the
+        # window (and its dock/taskbar entry) stays unmapped for as long as
+        # it takes to rebuild the tile grids from the on-disk catalog cache
+        # (icon decoding per app), check Code Master's own update status (a
+        # synchronous `git rev-parse`), and kick off the catalog/system-
+        # package scans.
+        QTimer.singleShot(0, self._start_up)
+
+    def _start_up(self):
         self.refresh_views()
         self.load_catalog()
         self._scan_system_installed()
@@ -291,7 +302,11 @@ class CodeMaster(QMainWindow):
 
         lay.addStretch()
         self._refresh_manual_list()
-        self._refresh_self_update_note()
+        # Not self._refresh_self_update_note() here — it shells out to `git
+        # rev-parse` (see _self_head_commit()), and this method runs during
+        # __init__'s synchronous widget construction, before the window is
+        # shown. The deferred refresh_views() call right after construction
+        # (see __init__) covers it moments later, off the startup path.
         return page
 
     # -- catalog ---------------------------------------------------------- #
