@@ -84,6 +84,12 @@ class CodeMaster(QMainWindow):
         # path itself, not the app key.
         self._busy = set()
         self._self_commit = None
+        # "Update All" state: apps still to process, and whether the queue
+        # is actively running — kept separate from the queue being empty,
+        # since the last queued app is still mid-update for a moment after
+        # it's popped.
+        self._update_queue = []
+        self._update_all_running = False
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -111,7 +117,17 @@ class CodeMaster(QMainWindow):
                                     [self.store_filter_bar, self.store_search_bar],
                                     self.store_grid), "Store")
         self.tabs.addTab(self._wrap(None, [], self.installed_grid), "Installed")
-        self.tabs.addTab(self._wrap(None, [], self.updates_grid), "Updates")
+        self.update_all_btn = QPushButton("Update All")
+        self.update_all_btn.setObjectName("Primary")
+        self.update_all_btn.setCursor(Qt.PointingHandCursor)
+        self.update_all_btn.setEnabled(False)
+        self.update_all_btn.clicked.connect(self.update_all)
+        updates_bar = QWidget()
+        updates_bar_lay = QHBoxLayout(updates_bar)
+        updates_bar_lay.setContentsMargins(18, 12, 18, 0)
+        updates_bar_lay.addWidget(self.update_all_btn)
+        updates_bar_lay.addStretch()
+        self.tabs.addTab(self._wrap(None, [updates_bar], self.updates_grid), "Updates")
         self.tabs.addTab(self._build_manual_tab(), "Manual & Settings")
 
         self.setStyleSheet(STYLE)
@@ -409,6 +425,8 @@ class CodeMaster(QMainWindow):
         idx = self.tabs.indexOf(self.tabs.widget(2)) if hasattr(self, "tabs") else -1
         if hasattr(self, "tabs") and idx >= 0:
             self.tabs.setTabText(idx, f"Updates ({len(apps)})" if apps else "Updates")
+        if hasattr(self, "update_all_btn"):
+            self.update_all_btn.setEnabled(bool(apps) and not self._update_all_running)
         if not apps:
             self.updates_grid.set_placeholder("Everything is up to date. 🎉")
             return
@@ -631,15 +649,17 @@ class CodeMaster(QMainWindow):
         self.refresh_views()
         self._toast(f"Installing {app['name']}…")
 
-    def update_app(self, app):
+    def update_app(self, app, on_done=None):
         if app.get("backend", "git") != "git":
-            self._update_system_package(app)
+            self._update_system_package(app, on_done=on_done)
             return
         app = self._resolve(app)
         repo_root = self._repo_root(app)
         busy_key = str(repo_root)
         if busy_key in self._busy:
             self._toast(f"{app['name']} already has an operation in progress")
+            if on_done:
+                on_done()
             return
         self._busy.add(busy_key)
         publisher = app.get("publisher", self.config["username"])
@@ -657,6 +677,8 @@ class CodeMaster(QMainWindow):
             if not ok:
                 QMessageBox.warning(self, "Update failed", msg)
                 self.refresh_views()
+                if on_done:
+                    on_done()
                 return
             # Refreshing the clone updates every installed app from this repo —
             # sync each one's stored version to the freshly installed one.
@@ -679,12 +701,38 @@ class CodeMaster(QMainWindow):
             save_installed(self.installed)
             self.refresh_views()
             self._toast(f"Updated {app['name']}")
+            if on_done:
+                on_done()
 
         worker.done.connect(finished)
         self._workers.add(worker)
         worker.start()
         self.refresh_views()
         self._toast(f"Updating {app['name']}…")
+
+    def update_all(self):
+        """Update every app currently listed in the Updates tab, one at a
+        time — apt/snap updates go through pkexec, and running several at
+        once would just fight over the package manager's lock."""
+        if self._update_all_running:
+            return
+        apps = [a for a in self._installed_apps() if self.has_update(a)]
+        if not apps:
+            return
+        self._update_queue = apps
+        self._update_all_running = True
+        self.update_all_btn.setEnabled(False)
+        self._toast(f"Updating {len(apps)} app(s)…")
+        self._run_next_queued_update()
+
+    def _run_next_queued_update(self):
+        if not self._update_queue:
+            self._update_all_running = False
+            self._toast("Update All finished")
+            self.refresh_views()
+            return
+        app = self._update_queue.pop(0)
+        self.update_app(app, on_done=self._run_next_queued_update)
 
     def install_deps(self, app):
         app = self._resolve(app)
@@ -796,10 +844,11 @@ class CodeMaster(QMainWindow):
     def _install_system_package(self, app):
         self._run_system_worker("install", app, f"Installing {app['name']}…")
 
-    def _update_system_package(self, app):
-        self._run_system_worker("update", app, f"Updating {app['name']}…")
+    def _update_system_package(self, app, on_done=None):
+        self._run_system_worker("update", app, f"Updating {app['name']}…",
+                                on_done=on_done)
 
-    def _run_system_worker(self, action, app, toast):
+    def _run_system_worker(self, action, app, toast, on_done=None):
         backend_name = app["backend"]
         pkg_id = app["pkg_id"]
         worker = SystemPackageWorker(action, backend_name, pkg_id)
@@ -808,6 +857,8 @@ class CodeMaster(QMainWindow):
             self._workers.discard(worker)
             if not ok:
                 QMessageBox.warning(self, f"{action.capitalize()} failed", msg)
+                if on_done:
+                    on_done()
                 return
             bucket = self.system_installed.setdefault(backend_name, {})
             # Whatever just happened (installed, updated, or removed), the
@@ -826,6 +877,8 @@ class CodeMaster(QMainWindow):
                                   "icon_data": app.get("icon_data")}
             self.refresh_views()
             self._toast(f"{msg}: {app['name']}")
+            if on_done:
+                on_done()
 
         worker.done.connect(finished)
         self._workers.add(worker)
