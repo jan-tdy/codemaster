@@ -110,7 +110,12 @@ class TileGrid(QScrollArea):
         cols = max(1, (width + self._spacing) // (self._tile_width + self._spacing))
         for idx, tile in enumerate(self._tiles):
             row, col = divmod(idx, cols)
-            self._grid.addWidget(tile, row, col)
+            # Without AlignTop, a grid row with nothing below it (e.g. a
+            # single short row of tiles in a tall viewport) is stretched to
+            # fill the leftover vertical space, and the tile widgets get
+            # stretched along with it — pinning each tile to the top of its
+            # cell keeps it at its natural height instead.
+            self._grid.addWidget(tile, row, col, Qt.AlignTop)
 
 
 # --------------------------------------------------------------------------- #
