@@ -1086,6 +1086,72 @@ def test_catalog_loader_init_excludes_incomplete_scan_entries():
     assert loader._cache_by_repo == {}
 
 
+# -- CatalogLoader malformed metadata handling (issue #30) -------------------- #
+def test_fetch_metadata_treats_non_dict_json_as_malformed():
+    """A codemaster-metadata.json that parses as JSON but isn't an object
+    (e.g. a bare array) is just as malformed as invalid JSON - it must be
+    treated the same way (as "no metadata"), not passed on to the
+    ``.get()`` calls in ``_apps_from_metadata``."""
+    loader = _bare_loader()
+    loader.branch = "main"
+    loader.session = _FakeGetSession(_FakeFetchResponse(200, payload=[{"id": "x"}]))
+    meta, branch = loader._fetch_metadata("jan-tdy", "repo-a", "main")
+    assert meta is None
+    assert branch is None
+
+
+def test_apps_from_metadata_ignores_non_dict_app_entries(monkeypatch):
+    """Garbage mixed into the "apps" array (strings, numbers, ...) must be
+    skipped rather than crashing when its non-dict entries hit `.get()`."""
+    loader = _bare_loader()
+    monkeypatch.setattr(loader, "_fetch_release", lambda *a: None)
+    monkeypatch.setattr(loader, "_fetch_latest_commit", lambda *a: "sha123")
+    monkeypatch.setattr(loader, "_fetch_icon", lambda *a: None)
+    meta = {"apps": [1, "oops", None, {"id": "ok-app", "name": "OK App"}]}
+    apps = loader._apps_from_metadata(meta, "jan-tdy", "repo-a", "main",
+                                      False, "2026-01-01", "jan-tdy")
+    assert [a["id"] for a in apps] == ["ok-app"]
+
+
+def test_apps_from_metadata_treats_non_list_apps_field_as_empty(monkeypatch):
+    loader = _bare_loader()
+    monkeypatch.setattr(loader, "_fetch_release", lambda *a: None)
+    monkeypatch.setattr(loader, "_fetch_latest_commit", lambda *a: None)
+    monkeypatch.setattr(loader, "_fetch_icon", lambda *a: None)
+    meta = {"apps": "not-a-list"}
+    apps = loader._apps_from_metadata(meta, "jan-tdy", "repo-a", "main",
+                                      False, "2026-01-01", "jan-tdy")
+    assert apps == []
+
+
+def test_run_isolates_a_single_repo_scan_failure_instead_of_aborting_the_whole_scan(monkeypatch):
+    """Regression test for issue #30: one repo whose scan blows up (e.g. a
+    malformed codemaster-metadata.json shape not caught earlier) must not
+    cost every other repo's already-gathered apps - the overall scan
+    should still succeed with the rest."""
+    loader = CatalogLoader("jan-tdy", "main", "")
+    monkeypatch.setattr(loader, "_list_repos", lambda: [
+        ("good-repo", "main", False, "2026-01-01"),
+        ("bad-repo", "main", False, "2026-01-01"),
+    ])
+
+    def _scan_repo(repo, default_branch, is_private, pushed_at):
+        if repo == "bad-repo":
+            raise AttributeError("'list' object has no attribute 'get'")
+        return [{"id": "ok", "repo": repo, "category": "Other", "name": "Ok App"}]
+    monkeypatch.setattr(loader, "_scan_repo", _scan_repo)
+    monkeypatch.setattr(loader, "_scan_community_catalog", lambda: [])
+
+    loaded, failed = [], []
+    loader.loaded.connect(loaded.append)
+    loader.failed.connect(failed.append)
+    loader.run()
+
+    assert failed == []
+    assert loaded == [[{"id": "ok", "repo": "good-repo", "category": "Other",
+                        "name": "Ok App"}]]
+
+
 # -- system_packages: table parsing + app-dict unification -------------------- #
 def test_parse_table_handles_tabwriter_style_padded_columns():
     table = (

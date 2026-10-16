@@ -213,9 +213,16 @@ class CatalogLoader(QThread):
                 continue
             if resp.status_code == 200:
                 try:
-                    return resp.json(), branch
+                    data = resp.json()
                 except ValueError:
                     return None, None
+                # A file that parses as JSON but isn't an object (e.g. an
+                # array, string, or number) is just as malformed as invalid
+                # JSON - treat it the same way (see issue #30) rather than
+                # letting the `.get()` calls below blow up on it.
+                if not isinstance(data, dict):
+                    return None, None
+                return data, branch
         return None, None
 
     def _fetch_release(self, publisher, repo):
@@ -280,6 +287,12 @@ class CatalogLoader(QThread):
         describes, enriched with icon/release/commit data. Shared by the
         primary scan and the community catalog, which differ only in
         *where* ``meta`` came from."""
+        # A malformed document may have no "apps" list at all, or one that
+        # holds things other than app objects (e.g. strings or numbers) -
+        # neither should crash the scan (see issue #30), so non-dict
+        # entries are silently dropped here rather than reaching the
+        # `.get()` calls below.
+        apps_in = [a for a in meta.get("apps") or [] if isinstance(a, dict)]
         # A transient failure (rate limit/5xx/network error) on any
         # sub-fetch below means this scan can't be trusted as a complete
         # snapshot. Track that in `incomplete` and fall back to whatever
@@ -287,21 +300,19 @@ class CatalogLoader(QThread):
         # repo's apps (and the update/icon info already fetched) entirely.
         incomplete = False
         release_tag = None
-        if any(a.get("update_method") == "release"
-               for a in meta.get("apps", [])):
+        if any(a.get("update_method") == "release" for a in apps_in):
             try:
                 release_tag = self._fetch_release(publisher, repo)
             except _TransientFetchError:
                 incomplete = True
         sync_commit = None
-        if any(a.get("update_method", "sync") != "release"
-               for a in meta.get("apps", [])):
+        if any(a.get("update_method", "sync") != "release" for a in apps_in):
             try:
                 sync_commit = self._fetch_latest_commit(publisher, repo, branch)
             except _TransientFetchError:
                 incomplete = True
         icons = []
-        for app in meta.get("apps", []):
+        for app in apps_in:
             app_branch = app.get("branch") or branch
             try:
                 icons.append(self._fetch_icon(publisher, repo, app_branch, app.get("icon")))
@@ -314,7 +325,7 @@ class CatalogLoader(QThread):
         # transient failure in as a permanent "no release/commit/icon".
         effective_pushed_at = None if incomplete else pushed_at
         apps = []
-        for app, icon_data in zip(meta.get("apps", []), icons):
+        for app, icon_data in zip(apps_in, icons):
             app_branch = app.get("branch") or branch
             method = app.get("update_method", "sync")
             apps.append({
@@ -490,7 +501,17 @@ class CatalogLoader(QThread):
                         done += 1
                         self.status.emit(
                             f"Scanning {repo}… ({done}/{len(to_scan)})")
-                        apps.extend(future.result())
+                        # One repo blowing up (e.g. a malformed
+                        # codemaster-metadata.json we didn't anticipate)
+                        # must not sink the apps already gathered from
+                        # every other repo - skip just this repo instead
+                        # (see issue #30), matching how the community
+                        # catalog scan below already isolates per-entry
+                        # failures.
+                        try:
+                            apps.extend(future.result())
+                        except Exception:  # noqa: BLE001
+                            continue
 
             self.status.emit("Scanning community catalog…")
             try:
