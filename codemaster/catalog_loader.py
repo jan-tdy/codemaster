@@ -22,6 +22,14 @@ from .constants import (
 )
 
 
+class _TransientFetchError(Exception):
+    """A sub-fetch (release/commit/icon) failed with something other than
+    a definitive 404 ("not present") - a rate limit, 5xx, or network
+    error. Distinguishing this from "repo genuinely has none" is what lets
+    the caller mark the repo's apps incomplete instead of caching the
+    failure as if it were a real answer (see issue #29)."""
+
+
 class CatalogLoader(QThread):
     """Discover every app published through codemaster-metadata.json."""
     loaded = pyqtSignal(list)
@@ -50,6 +58,11 @@ class CatalogLoader(QThread):
         # path, keyed on that file's own content hash plus the *target*
         # repo's pushed_at, since either one changing means a rescan.
         self._community_cache = {}
+        # Only ever flips to True and is only read for a user-facing
+        # status message, so a benign race between parallel scan workers
+        # (reporting twice, or a hair later than the first 403) is fine -
+        # it doesn't gate caching or correctness.
+        self._rate_limit_reported = False
         for app in cached_apps or []:
             if app.get("catalog_source") == "community":
                 path = app.get("catalog_file")
@@ -78,9 +91,9 @@ class CatalogLoader(QThread):
         """Build the optional GitHub API authorization headers."""
         return {"Authorization": f"token {self.token}"} if self.token else {}
 
-    def _raise_for_status(self, resp):
-        """Raise an actionable error when GitHub API rate limits are
-        exhausted."""
+    def _rate_limit_error(self, resp):
+        """The actionable RuntimeError for a 403 response that has
+        exhausted the GitHub API rate limit, or None if this isn't that."""
         if resp.status_code == 403 and \
                 resp.headers.get("X-RateLimit-Remaining") == "0":
             when = ""
@@ -95,9 +108,25 @@ class CatalogLoader(QThread):
                     "token to raise the limit." if not self.token else
                     "Your configured GitHub token has also hit its rate "
                     "limit — try again later.")
-            raise RuntimeError(
-                f"GitHub API rate limit reached.{when} {hint}")
+            return RuntimeError(f"GitHub API rate limit reached.{when} {hint}")
+        return None
+
+    def _raise_for_status(self, resp):
+        """Raise an actionable error when GitHub API rate limits are
+        exhausted."""
+        err = self._rate_limit_error(resp)
+        if err:
+            raise err
         resp.raise_for_status()
+
+    def _report_rate_limit(self, resp):
+        """Surface a rate-limited 403 via the status line instead of
+        raising, for sub-fetches that shouldn't abort the whole scan just
+        because one repo's release/commit/icon call got rate-limited."""
+        err = self._rate_limit_error(resp)
+        if err and not self._rate_limit_reported:
+            self._rate_limit_reported = True
+            self.status.emit(str(err))
 
     def _authenticated_login(self):
         """Determine the GitHub account associated with the configured
@@ -190,40 +219,58 @@ class CatalogLoader(QThread):
         return None, None
 
     def _fetch_release(self, publisher, repo):
-        """Latest published release tag for a repo, or None if it has none."""
+        """Latest published release tag for a repo, or None if it
+        definitively has none (404). Raises ``_TransientFetchError`` on a
+        rate limit, 5xx, or network error, so the caller doesn't cache
+        that as "no release" (see issue #29)."""
         url = f"https://api.github.com/repos/{publisher}/{repo}/releases/latest"
         try:
             resp = self.session.get(url, headers=self._headers(), timeout=20)
-            if resp.status_code == 200:
-                return resp.json().get("tag_name")
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            raise _TransientFetchError(str(exc)) from exc
+        if resp.status_code == 200:
+            return resp.json().get("tag_name")
+        if resp.status_code == 404:
             return None
-        return None
+        self._report_rate_limit(resp)
+        raise _TransientFetchError(f"HTTP {resp.status_code}")
 
     def _fetch_latest_commit(self, publisher, repo, branch):
         """Latest commit SHA on ``branch``, used to detect updates for
         'sync' apps whose publisher may forget to bump the metadata
-        version."""
+        version. None if ``branch`` definitively doesn't exist (404).
+        Raises ``_TransientFetchError`` on a rate limit, 5xx, or network
+        error, so the caller doesn't cache that as "no commit"."""
         url = f"https://api.github.com/repos/{publisher}/{repo}/commits/{branch}"
         try:
             resp = self.session.get(url, headers=self._headers(), timeout=20)
-            if resp.status_code == 200:
-                return resp.json().get("sha")
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            raise _TransientFetchError(str(exc)) from exc
+        if resp.status_code == 200:
+            return resp.json().get("sha")
+        if resp.status_code == 404:
             return None
-        return None
+        self._report_rate_limit(resp)
+        raise _TransientFetchError(f"HTTP {resp.status_code}")
 
     def _fetch_icon(self, publisher, repo, branch, icon_path):
+        """Icon bytes, or None if there's no icon configured or it
+        definitively isn't there (404). Raises ``_TransientFetchError`` on
+        a rate limit, 5xx, or network error, so the caller doesn't cache
+        that as "no icon"."""
         if not icon_path:
             return None
         raw = f"https://raw.githubusercontent.com/{publisher}/{repo}/{branch}/{icon_path}"
         try:
             resp = self.session.get(raw, headers=self._headers(), timeout=20)
-            if resp.status_code == 200:
-                return resp.content
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            raise _TransientFetchError(str(exc)) from exc
+        if resp.status_code == 200:
+            return resp.content
+        if resp.status_code == 404:
             return None
-        return None
+        self._report_rate_limit(resp)
+        raise _TransientFetchError(f"HTTP {resp.status_code}")
 
     # -- building app dicts from a metadata document ------------------ #
     def _apps_from_metadata(self, meta, publisher, repo, branch, is_private,
@@ -233,25 +280,49 @@ class CatalogLoader(QThread):
         describes, enriched with icon/release/commit data. Shared by the
         primary scan and the community catalog, which differ only in
         *where* ``meta`` came from."""
+        # A transient failure (rate limit/5xx/network error) on any
+        # sub-fetch below means this scan can't be trusted as a complete
+        # snapshot. Track that in `incomplete` and fall back to whatever
+        # partial data we got, rather than letting the exception drop the
+        # repo's apps (and the update/icon info already fetched) entirely.
+        incomplete = False
         release_tag = None
         if any(a.get("update_method") == "release"
                for a in meta.get("apps", [])):
-            release_tag = self._fetch_release(publisher, repo)
+            try:
+                release_tag = self._fetch_release(publisher, repo)
+            except _TransientFetchError:
+                incomplete = True
         sync_commit = None
         if any(a.get("update_method", "sync") != "release"
                for a in meta.get("apps", [])):
-            sync_commit = self._fetch_latest_commit(publisher, repo, branch)
-        apps = []
+            try:
+                sync_commit = self._fetch_latest_commit(publisher, repo, branch)
+            except _TransientFetchError:
+                incomplete = True
+        icons = []
         for app in meta.get("apps", []):
             app_branch = app.get("branch") or branch
-            icon_data = self._fetch_icon(publisher, repo, app_branch, app.get("icon"))
+            try:
+                icons.append(self._fetch_icon(publisher, repo, app_branch, app.get("icon")))
+            except _TransientFetchError:
+                icons.append(None)
+                incomplete = True
+        # Drop repo_pushed_at on an incomplete scan so `_cached_apps_for()`
+        # never treats this repo as reusable from cache next launch - it
+        # always falls through to a real rescan instead of baking today's
+        # transient failure in as a permanent "no release/commit/icon".
+        effective_pushed_at = None if incomplete else pushed_at
+        apps = []
+        for app, icon_data in zip(meta.get("apps", []), icons):
+            app_branch = app.get("branch") or branch
             method = app.get("update_method", "sync")
             apps.append({
                 "backend": "git",
                 "key": f"{publisher}/{repo}/{app.get('id')}",
                 "publisher": publisher,
                 "repo": repo,
-                "repo_pushed_at": pushed_at,
+                "repo_pushed_at": effective_pushed_at,
                 "branch": app_branch,
                 "id": app.get("id"),
                 "name": app.get("name", app.get("id", "?")),
@@ -275,6 +346,7 @@ class CatalogLoader(QThread):
                 "catalog_source": catalog_source,
                 "catalog_file": catalog_file,
                 "catalog_file_sha": catalog_file_sha,
+                "incomplete": incomplete,
             })
         return apps
 

@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import QApplication, QMessageBox  # noqa: E402
 _app = QApplication.instance() or QApplication([])
 
 from codemaster import desktop_entry, persistence, system_packages  # noqa: E402
-from codemaster.catalog_loader import CatalogLoader  # noqa: E402
+from codemaster.catalog_loader import CatalogLoader, _TransientFetchError  # noqa: E402
 from codemaster.git_worker import GitWorker, apt_package_name, apt_requirement_satisfied  # noqa: E402
 from codemaster.main_window import CodeMaster, app_source  # noqa: E402
 from codemaster.constants import APP_VERSION, xdg_data_home  # noqa: E402
@@ -926,6 +926,164 @@ def test_apps_from_metadata_keys_by_publisher_repo_and_id(monkeypatch):
     assert apps[0]["publisher"] == "someone-else"
     assert apps[0]["catalog_source"] == "community"
     assert apps[0]["backend"] == "git"
+
+
+# -- CatalogLoader transient sub-fetch failures (issue #29) ------------------- #
+class _FakeFetchResponse(_FakeResponse):
+    def __init__(self, status_code, headers=None, payload=None, content=b""):
+        super().__init__(status_code, headers)
+        self._payload = payload or {}
+        self.content = content
+
+    def json(self):
+        return self._payload
+
+
+class _FakeGetSession:
+    """Returns a fixed response (or raises a fixed exception) for every
+    .get() call, regardless of url/headers/timeout."""
+
+    def __init__(self, response=None, exc=None):
+        self._response = response
+        self._exc = exc
+
+    def get(self, url, headers=None, timeout=None):
+        if self._exc:
+            raise self._exc
+        return self._response
+
+
+def test_fetch_release_returns_none_on_definitive_404():
+    loader = _bare_loader()
+    loader.session = _FakeGetSession(_FakeFetchResponse(404))
+    assert loader._fetch_release("pub", "repo") is None
+
+
+def test_fetch_release_raises_transient_on_5xx():
+    loader = _bare_loader()
+    loader.session = _FakeGetSession(_FakeFetchResponse(503))
+    try:
+        loader._fetch_release("pub", "repo")
+        assert False, "expected _TransientFetchError"
+    except _TransientFetchError:
+        pass
+
+
+def test_fetch_release_raises_transient_on_network_error():
+    loader = _bare_loader()
+    loader.session = _FakeGetSession(exc=requests.ConnectionError("boom"))
+    try:
+        loader._fetch_release("pub", "repo")
+        assert False, "expected _TransientFetchError"
+    except _TransientFetchError:
+        pass
+
+
+def test_fetch_release_reports_rate_limit_via_status_instead_of_caching_as_absent():
+    loader = CatalogLoader("jan-tdy", "main", "")
+    loader.session = _FakeGetSession(
+        _FakeFetchResponse(403, {"X-RateLimit-Remaining": "0"}))
+    messages = []
+    loader.status.connect(messages.append)
+    try:
+        loader._fetch_release("pub", "repo")
+        assert False, "expected _TransientFetchError"
+    except _TransientFetchError:
+        pass
+    assert len(messages) == 1
+    assert "rate limit" in messages[0].lower()
+
+
+def test_fetch_latest_commit_raises_transient_on_5xx():
+    loader = _bare_loader()
+    loader.session = _FakeGetSession(_FakeFetchResponse(500))
+    try:
+        loader._fetch_latest_commit("pub", "repo", "main")
+        assert False, "expected _TransientFetchError"
+    except _TransientFetchError:
+        pass
+
+
+def test_fetch_latest_commit_returns_none_on_definitive_404():
+    loader = _bare_loader()
+    loader.session = _FakeGetSession(_FakeFetchResponse(404))
+    assert loader._fetch_latest_commit("pub", "repo", "main") is None
+
+
+def test_fetch_icon_raises_transient_on_5xx():
+    loader = _bare_loader()
+    loader.session = _FakeGetSession(_FakeFetchResponse(500))
+    try:
+        loader._fetch_icon("pub", "repo", "main", "icon.png")
+        assert False, "expected _TransientFetchError"
+    except _TransientFetchError:
+        pass
+
+
+def test_fetch_icon_returns_none_on_definitive_404():
+    loader = _bare_loader()
+    loader.session = _FakeGetSession(_FakeFetchResponse(404))
+    assert loader._fetch_icon("pub", "repo", "main", "icon.png") is None
+
+
+def test_apps_from_metadata_marks_incomplete_and_drops_pushed_at_on_transient_failure(monkeypatch):
+    """Regression test for issue #29: a transient failure (rate
+    limit/network) fetching the release tag must not be baked into the
+    cache as a definitive "no release" - it should flag the repo's apps
+    incomplete and clear repo_pushed_at so they're rescanned next launch
+    instead of served from cache forever."""
+    loader = _bare_loader()
+    def _boom(*a):
+        raise _TransientFetchError("rate limited")
+    monkeypatch.setattr(loader, "_fetch_release", _boom)
+    monkeypatch.setattr(loader, "_fetch_latest_commit", lambda *a: "sha123")
+    monkeypatch.setattr(loader, "_fetch_icon", lambda *a: b"icon-bytes")
+    meta = {"apps": [{"id": "app1", "name": "App One",
+                      "update_method": "release"}]}
+    apps = loader._apps_from_metadata(meta, "jan-tdy", "repo-a", "main",
+                                      False, "2026-01-01", "jan-tdy")
+    assert apps[0]["incomplete"] is True
+    assert apps[0]["repo_pushed_at"] is None
+    # Data that *did* fetch successfully for this same repo/app is still
+    # surfaced, rather than being thrown away over one failed sub-fetch.
+    assert apps[0]["icon_data"] == b"icon-bytes"
+
+
+def test_apps_from_metadata_not_incomplete_when_all_fetches_succeed(monkeypatch):
+    loader = _bare_loader()
+    monkeypatch.setattr(loader, "_fetch_release", lambda *a: "v1.2.3")
+    monkeypatch.setattr(loader, "_fetch_latest_commit", lambda *a: "sha123")
+    monkeypatch.setattr(loader, "_fetch_icon", lambda *a: None)
+    meta = {"apps": [{"id": "app1", "name": "App One",
+                      "update_method": "release"}]}
+    apps = loader._apps_from_metadata(meta, "jan-tdy", "repo-a", "main",
+                                      False, "2026-01-01", "jan-tdy")
+    assert apps[0]["incomplete"] is False
+    assert apps[0]["repo_pushed_at"] == "2026-01-01"
+
+
+def test_cached_apps_for_misses_when_prior_scan_was_incomplete():
+    """A repo whose previous scan was incomplete (repo_pushed_at cleared
+    to None) must never be served from cache, even on a launch where the
+    live pushed_at happens to come back unchanged."""
+    loader = _bare_loader()
+    loader._cache_by_repo = {
+        "repo-a": [{"repo": "repo-a", "repo_pushed_at": None,
+                    "incomplete": True, "id": "app1"}],
+    }
+    assert loader._cached_apps_for("repo-a", "t1") is None
+
+
+def test_catalog_loader_init_excludes_incomplete_scan_entries():
+    """An incomplete scan's apps (repo_pushed_at=None) loaded from the
+    on-disk cache must not populate _cache_by_repo, so the repo is
+    unconditionally rescanned rather than skipped as "unchanged"."""
+    cached_apps = [
+        {"repo": "repo-a", "repo_pushed_at": None, "incomplete": True,
+         "id": "app1", "publisher": "jan-tdy"},
+    ]
+    loader = CatalogLoader("jan-tdy", "main", "", cached_apps=cached_apps)
+    assert loader._cache_by_repo == {}
 
 
 # -- system_packages: table parsing + app-dict unification -------------------- #
