@@ -511,6 +511,8 @@ class CodeMaster(QMainWindow):
             if not latest_commit:
                 return False
             return latest_commit != rec.get("commit")
+        if not catalog.get("release_tag"):
+            return False
         latest = self.effective_version(catalog)
         if not latest:
             return False
@@ -681,6 +683,13 @@ class CodeMaster(QMainWindow):
         publisher = app.get("publisher", self.config["username"])
         catalog = next((a for a in self.catalog if a["key"] == app["key"]),
                        None) or app
+        method = catalog.get("update_method", "sync")
+        release_tag = catalog.get("release_tag")
+        if method == "release" and not release_tag:
+            self._toast(f"Cannot update {app['name']}: latest release tag is unavailable")
+            if on_done:
+                on_done()
+            return
         worker = GitWorker("update", publisher, app["repo"], repo_root,
                            app.get("branch", self.config["branch"]),
                            method=catalog.get("update_method", "sync"),
