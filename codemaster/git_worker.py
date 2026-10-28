@@ -280,6 +280,10 @@ class GitWorker(QThread):
         dependencies. Failures are reported through the completion signal.
         """
         try:
+            # A missing release tag means the release lookup failed. Never
+            # fall through to branch sync for a release-pinned installation.
+            if self.method == "release" and not self.release_tag:
+                raise RuntimeError("Latest release tag is unavailable; refusing branch update")
             # "release" apps track a tagged GitHub release; "sync" apps track
             # the latest code on a branch.
             release = (self.method == "release" and self.release_tag)
