@@ -59,6 +59,17 @@ publishes the Telescope Cover, Astrofoto, Atacama (C14) and DSLR apps.
   update. Flatpak isn't probed — its **Update** button stays always
   available once installed instead (its own package manager decides
   whether there's anything to do).
+- **🏷 Choose version** — for `release` apps published straight from a
+  [jan-tdy](https://github.com/jan-tdy) repository (not community catalog
+  submissions), a **Choose version…** button on the details page lists
+  every published GitHub release with its own release notes, so you can
+  install — or roll back to — a specific version instead of always the
+  latest. A manually picked version still shows up in **Updates** once a
+  newer release exists.
+- **📜 Changelog** — every APT/Snap/Flatpak package's details page has a
+  **Changelog** button. For APT it fetches the package's real Debian
+  changelog with `apt-get changelog`; Snap and Flatpak have no equivalent
+  CLI changelog to fetch, so it says that plainly instead.
 - **⚙ Manual & Settings** — register apps you installed **by hand** by
   pointing Code Master at a folder containing a `codemaster-metadata.json`
   file, and **remove** a registered location again (which also drops the

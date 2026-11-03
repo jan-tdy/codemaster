@@ -333,6 +333,13 @@ class AptBackend:
         subprocess.Popen([binary], stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
 
+    @staticmethod
+    def changelog(pkg):
+        """The Debian/Ubuntu changelog for ``pkg``, fetched over the
+        network (``apt-get changelog`` needs no root — it just downloads
+        the *.changes file apt already knows the URL for)."""
+        return _run(["apt-get", "changelog", pkg], timeout=30)
+
 
 # --------------------------------------------------------------------------- #
 #  snap
@@ -442,6 +449,13 @@ class SnapBackend:
     def launch(name):
         subprocess.Popen(["snap", "run", name], stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+
+    @staticmethod
+    def changelog(name):
+        # snapd has no changelog/release-notes command of its own — a
+        # snap's publisher may put notes in its store description, but
+        # there's nothing structured to fetch here.
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -554,6 +568,13 @@ class FlatpakBackend:
         subprocess.Popen(["flatpak", "run", app_id], stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
 
+    @staticmethod
+    def changelog(app_id):
+        # Flatpak exposes release notes through its appstream metadata,
+        # not a stable CLI subcommand — nothing to fetch here with
+        # confidence.
+        return None
+
 
 BACKENDS = {
     "apt": AptBackend,
@@ -633,6 +654,34 @@ class SystemPackageWorker(QThread):
                 self.done.emit(False, f"Unknown action: {self.action}")
         except Exception as exc:  # noqa: BLE001
             self.done.emit(False, str(exc))
+
+
+class ChangelogWorker(QThread):
+    """Fetch an installed package's changelog without freezing the UI.
+    Emits ``(True, text)`` on success, ``(False, message)`` when the
+    backend has none to offer or the fetch failed."""
+    loaded = pyqtSignal(bool, str)
+
+    def __init__(self, backend_name, pkg_id):
+        super().__init__()
+        self.backend_name = backend_name
+        self.pkg_id = pkg_id
+
+    def run(self):
+        backend = BACKENDS.get(self.backend_name)
+        if not backend:
+            self.loaded.emit(False, f"Unknown backend: {self.backend_name}")
+            return
+        try:
+            text = backend.changelog(self.pkg_id)
+        except Exception as exc:  # noqa: BLE001
+            self.loaded.emit(False, str(exc))
+            return
+        if text:
+            self.loaded.emit(True, text)
+        else:
+            self.loaded.emit(
+                False, f"No changelog is available for {backend.label} packages.")
 
 
 class InstalledScanWorker(QThread):
