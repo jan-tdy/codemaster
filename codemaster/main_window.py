@@ -614,7 +614,11 @@ class CodeMaster(QMainWindow):
         self.details_page.show_app(resolved)
         self.content_stack.setCurrentWidget(self.details_page)
 
-    def install_app(self, app):
+    def install_app(self, app, release_tag=None):
+        """``release_tag``, when given, pins a "release"-method app to a
+        specific published tag instead of whatever the catalog scan last
+        saw as latest — how the version picker (jan-tdy repos only) drives
+        an install of a chosen version."""
         if app.get("backend", "git") != "git":
             self._install_system_package(app)
             return
@@ -626,11 +630,12 @@ class CodeMaster(QMainWindow):
         if busy_key in self._busy:
             self._toast(f"{app['name']} already has an operation in progress")
             return
+        tag = release_tag or app.get("release_tag")
         self._busy.add(busy_key)
         worker = GitWorker("install", publisher, app["repo"], repo_root,
                            app.get("branch", self.config["branch"]),
                            method=app.get("update_method", "sync"),
-                           release_tag=app.get("release_tag"),
+                           release_tag=tag,
                            token=self.config["token"])
 
         def finished(ok, msg, commit=""):
@@ -644,7 +649,8 @@ class CodeMaster(QMainWindow):
                 "name": app["name"], "repo": app["repo"],
                 "publisher": publisher,
                 "category": app["category"],
-                "version": self.effective_version(app),
+                "version": tag if (app.get("update_method") == "release"
+                                   and tag) else self.effective_version(app),
                 # Only ever the commit GitWorker actually checked out — never
                 # the pre-fetch catalog SHA. If HEAD resolution failed
                 # (rev-parse error after an otherwise successful clone/pull),
@@ -667,7 +673,11 @@ class CodeMaster(QMainWindow):
         self.refresh_views()
         self._toast(f"Installing {app['name']}…")
 
-    def update_app(self, app, on_done=None):
+    def update_app(self, app, on_done=None, release_tag=None):
+        """``release_tag``, when given, pins a "release"-method app to a
+        specific published tag instead of the catalog's latest — how the
+        version picker (jan-tdy repos only) drives an update to a chosen
+        version, including downgrading to an older one."""
         if app.get("backend", "git") != "git":
             self._update_system_package(app, on_done=on_done)
             return
@@ -684,16 +694,16 @@ class CodeMaster(QMainWindow):
         catalog = next((a for a in self.catalog if a["key"] == app["key"]),
                        None) or app
         method = catalog.get("update_method", "sync")
-        release_tag = catalog.get("release_tag")
-        if method == "release" and not release_tag:
+        tag = release_tag or catalog.get("release_tag")
+        if method == "release" and not tag:
+            self._busy.discard(busy_key)
             self._toast(f"Cannot update {app['name']}: latest release tag is unavailable")
             if on_done:
                 on_done()
             return
         worker = GitWorker("update", publisher, app["repo"], repo_root,
                            app.get("branch", self.config["branch"]),
-                           method=catalog.get("update_method", "sync"),
-                           release_tag=catalog.get("release_tag"),
+                           method=method, release_tag=tag,
                            token=self.config["token"])
 
         def finished(ok, msg, commit=""):
@@ -712,17 +722,24 @@ class CodeMaster(QMainWindow):
                         inst.get("publisher", self.config["username"]) == publisher:
                     cat = next((a for a in self.catalog
                                 if a["key"] == key), None)
-                    if cat:
-                        inst["version"] = self.effective_version(cat)
-                        # Same rule as install_app: never substitute the
-                        # catalog's pre-fetch SHA for a failed HEAD resolve.
-                        inst["commit"] = commit
-                        # Pick up a publisher's changed run command too —
-                        # _resolve() overlays this stored value over the
-                        # catalog's, so a stale one here would silently keep
-                        # launching the old command (and never re-prompt via
-                        # _confirm_run, since that compares against this).
-                        inst["run"] = cat.get("run", "")
+                    if not cat:
+                        continue
+                    # A version explicitly chosen in the picker wins over
+                    # the catalog's own latest-release figure — otherwise a
+                    # deliberate downgrade would be overwritten right back
+                    # to "latest" the moment this finishes.
+                    inst["version"] = tag if (release_tag and
+                                              cat.get("update_method") == "release") \
+                        else self.effective_version(cat)
+                    # Same rule as install_app: never substitute the
+                    # catalog's pre-fetch SHA for a failed HEAD resolve.
+                    inst["commit"] = commit
+                    # Pick up a publisher's changed run command too —
+                    # _resolve() overlays this stored value over the
+                    # catalog's, so a stale one here would silently keep
+                    # launching the old command (and never re-prompt via
+                    # _confirm_run, since that compares against this).
+                    inst["run"] = cat.get("run", "")
             save_installed(self.installed)
             self.refresh_views()
             self._toast(f"Updated {app['name']}")

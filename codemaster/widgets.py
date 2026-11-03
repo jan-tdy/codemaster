@@ -9,13 +9,14 @@ call back into it (``controller.install_app(app)``, ``controller.is_installed(ap
 import requests
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
-    QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QPushButton, QScrollArea, QTextEdit,
-    QVBoxLayout, QWidget,
+    QComboBox, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QScrollArea,
+    QSplitter, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .constants import TILE_ICON_SIZE
 from .icons import pixmap_from_bytes, placeholder_pixmap
+from .system_packages import ChangelogWorker
 
 TILE_WIDTH = 220
 TILE_SPACING = 16
@@ -423,6 +424,124 @@ class ReadmeLoader(QThread):
         self.loaded.emit(self.key, "")
 
 
+class ReleasesLoader(QThread):
+    """Fetch a jan-tdy repo's published GitHub releases (tag, name, notes),
+    off the UI thread — used by the version picker, which needs the full
+    list rather than just the latest tag the catalog scan already has."""
+    loaded = pyqtSignal(list)  # [{"tag_name", "name", "body", "published_at"}, ...]
+    failed = pyqtSignal(str)
+
+    def __init__(self, publisher, repo, token=""):
+        super().__init__()
+        self.publisher = publisher
+        self.repo = repo
+        self.token = token
+
+    def run(self):
+        url = (f"https://api.github.com/repos/{self.publisher}/"
+               f"{self.repo}/releases?per_page=30")
+        headers = {"Authorization": f"token {self.token}"} if self.token else {}
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+        except requests.RequestException as exc:
+            self.failed.emit(str(exc))
+            return
+        if resp.status_code != 200:
+            self.failed.emit(f"GitHub returned HTTP {resp.status_code}")
+            return
+        try:
+            data = resp.json()
+        except ValueError:
+            self.failed.emit("GitHub returned an unreadable response")
+            return
+        releases = [{
+            "tag_name": r.get("tag_name", ""),
+            "name": r.get("name") or r.get("tag_name", ""),
+            "body": r.get("body") or "",
+            "published_at": r.get("published_at") or "",
+        } for r in data if isinstance(r, dict) and r.get("tag_name")]
+        self.loaded.emit(releases)
+
+
+class VersionDialog(QDialog):
+    """Pick a published release of a jan-tdy app to install/update to,
+    showing that release's own notes as its changelog."""
+
+    def __init__(self, app, releases, installing, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Choose a version — {app.get('name', '?')}")
+        self.resize(640, 480)
+        self.chosen_tag = None
+
+        lay = QVBoxLayout(self)
+        splitter = QSplitter(Qt.Horizontal)
+        lay.addWidget(splitter, 1)
+
+        self.list = QListWidget()
+        for rel in releases:
+            label = format_version(rel["tag_name"])
+            if rel["name"] and rel["name"] != rel["tag_name"]:
+                label += f"  —  {rel['name']}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, rel)
+            self.list.addItem(item)
+        splitter.addWidget(self.list)
+
+        self.notes = QTextEdit()
+        self.notes.setReadOnly(True)
+        self.notes.setPlaceholderText("Select a version to see its changelog.")
+        splitter.addWidget(self.notes)
+        splitter.setSizes([220, 420])
+
+        self.list.currentItemChanged.connect(self._on_selected)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        confirm = QPushButton("Install this version" if installing
+                              else "Update to this version")
+        confirm.setObjectName("Primary")
+        confirm.clicked.connect(self._confirm)
+        buttons.addWidget(confirm)
+        lay.addLayout(buttons)
+
+    def _on_selected(self, item, _previous=None):
+        if not item:
+            self.notes.setPlainText("")
+            return
+        rel = item.data(Qt.UserRole)
+        self.notes.setMarkdown(rel.get("body") or "*No release notes.*")
+
+    def _confirm(self):
+        item = self.list.currentItem()
+        if not item:
+            return
+        self.chosen_tag = item.data(Qt.UserRole)["tag_name"]
+        self.accept()
+
+
+class TextDialog(QDialog):
+    """A simple scrollable read-only text viewer — used for apt/snap/flatpak
+    changelogs, which arrive as plain text rather than README-style markdown."""
+
+    def __init__(self, title, text, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(640, 480)
+        lay = QVBoxLayout(self)
+        view = QTextEdit()
+        view.setReadOnly(True)
+        view.setPlainText(text)
+        lay.addWidget(view)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        lay.addWidget(close, alignment=Qt.AlignRight)
+
+
 # --------------------------------------------------------------------------- #
 #  Details page
 # --------------------------------------------------------------------------- #
@@ -553,9 +672,19 @@ class DetailsPage(QScrollArea):
         app = self.app
         c = self.controller
         installed = c.is_installed(app)
+        # Picking a specific version only makes sense for release-tagged
+        # apps published straight from jan-tdy's own repos — community
+        # submissions and sync apps have no tag history to choose from.
+        versioned = (app.get("backend") == "git"
+                    and app.get("update_method") == "release"
+                    and app.get("catalog_source") == "jan-tdy")
         actions = []
         if not installed:
             actions.append(("Install", "Primary", c.install_app, True))
+            if versioned:
+                actions.append(("Choose version…", "Ghost", self._choose_version, True))
+            if app.get("backend") != "git":
+                actions.append(("Changelog", "Ghost", self._show_changelog, False))
             if app.get("homepage"):
                 actions.append(("Open homepage", "Ghost", c.open_homepage, False))
             return actions
@@ -576,10 +705,57 @@ class DetailsPage(QScrollArea):
                 actions.append(("Add to menu", "Ghost", c.create_launcher, False))
             if app.get("requirements"):
                 actions.append(("Install deps", "Ghost", c.install_deps, True))
+            if versioned:
+                actions.append(("Choose version…", "Ghost", self._choose_version, True))
+        else:
+            actions.append(("Changelog", "Ghost", self._show_changelog, False))
         actions.append(("Remove", "Ghost", c.uninstall_app, True))
         if app.get("homepage"):
             actions.append(("Homepage", "Ghost", c.open_homepage, False))
         return actions
+
+    # -- version picker (jan-tdy release apps) ----------------------------- #
+    def _choose_version(self, app):
+        token = self.controller.config.get("token", "")
+        self._versions_btn_app = app
+        self._releases_loader = ReleasesLoader(
+            app.get("publisher"), app.get("repo"), token=token)
+        self._releases_loader.loaded.connect(
+            lambda releases: self._on_releases_loaded(app, releases))
+        self._releases_loader.failed.connect(self._on_releases_failed)
+        self._releases_loader.start()
+
+    def _on_releases_failed(self, message):
+        QMessageBox.warning(self, "Couldn't fetch releases",
+                            f"Could not list this app's releases:\n{message}")
+
+    def _on_releases_loaded(self, app, releases):
+        if not releases:
+            QMessageBox.information(self, "No releases",
+                                    "This repository has no published releases.")
+            return
+        installing = not self.controller.is_installed(app)
+        dialog = VersionDialog(app, releases, installing, parent=self)
+        if dialog.exec_() != QDialog.Accepted or not dialog.chosen_tag:
+            return
+        if installing:
+            self.controller.install_app(app, release_tag=dialog.chosen_tag)
+        else:
+            self.controller.update_app(app, release_tag=dialog.chosen_tag)
+
+    # -- changelog (apt/snap/flatpak) --------------------------------------- #
+    def _show_changelog(self, app):
+        self._changelog_app = app
+        self._changelog_worker = ChangelogWorker(app.get("backend"), app.get("pkg_id"))
+        self._changelog_worker.loaded.connect(
+            lambda ok, text: self._on_changelog_loaded(app, ok, text))
+        self._changelog_worker.start()
+
+    def _on_changelog_loaded(self, app, ok, text):
+        if ok:
+            TextDialog(f"Changelog — {app.get('name', '?')}", text, parent=self).exec_()
+        else:
+            QMessageBox.information(self, "Changelog", text)
 
     def _load_readme(self, app):
         cached = self._readme_cache.get(app["key"])

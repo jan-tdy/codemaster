@@ -22,7 +22,8 @@ from codemaster.git_worker import GitWorker, apt_package_name, apt_requirement_s
 from codemaster.main_window import CodeMaster, app_source  # noqa: E402
 from codemaster.constants import APP_VERSION, xdg_data_home  # noqa: E402
 from codemaster.widgets import (  # noqa: E402
-    AppTile, CategorySidebar, DetailsPage, FilterBar, TileGrid, format_version,
+    AppTile, CategorySidebar, DetailsPage, FilterBar, ReleasesLoader, TileGrid,
+    VersionDialog, format_version,
 )
 
 
@@ -1705,3 +1706,156 @@ def test_format_version_does_not_double_an_existing_v_prefix():
 def test_format_version_empty_stays_empty():
     assert format_version("") == ""
     assert format_version(None) == ""
+
+
+# -- version picker (jan-tdy release apps only) ----------------------------- #
+def test_details_page_offers_choose_version_for_jan_tdy_release_app(monkeypatch):
+    def no_network(*_a, **_kw):
+        raise requests.RequestException("no network in tests")
+    monkeypatch.setattr("codemaster.widgets.requests.get", no_network)
+
+    store = _bare_store()
+    page = DetailsPage(store)
+    app = {"backend": "git", "key": "jan-tdy/repo/app", "name": "App",
+          "category": "Tools", "version": "1.0", "update_method": "release",
+          "catalog_source": "jan-tdy", "repo": "repo", "publisher": "jan-tdy"}
+    page.show_app(app)
+
+    from PyQt5.QtWidgets import QPushButton
+    labels = {btn.text() for btn in page.findChildren(QPushButton)}
+    assert "Choose version…" in labels
+
+
+def test_details_page_hides_choose_version_for_community_release_app(monkeypatch):
+    def no_network(*_a, **_kw):
+        raise requests.RequestException("no network in tests")
+    monkeypatch.setattr("codemaster.widgets.requests.get", no_network)
+
+    store = _bare_store()
+    page = DetailsPage(store)
+    app = {"backend": "git", "key": "other/repo/app", "name": "App",
+          "category": "Tools", "version": "1.0", "update_method": "release",
+          "catalog_source": "community", "repo": "repo", "publisher": "other"}
+    page.show_app(app)
+
+    from PyQt5.QtWidgets import QPushButton
+    labels = {btn.text() for btn in page.findChildren(QPushButton)}
+    assert "Choose version…" not in labels
+
+
+def test_details_page_hides_choose_version_for_sync_jan_tdy_app(monkeypatch):
+    def no_network(*_a, **_kw):
+        raise requests.RequestException("no network in tests")
+    monkeypatch.setattr("codemaster.widgets.requests.get", no_network)
+
+    store = _bare_store()
+    page = DetailsPage(store)
+    app = {"backend": "git", "key": "jan-tdy/repo/app", "name": "App",
+          "category": "Tools", "version": "1.0", "update_method": "sync",
+          "catalog_source": "jan-tdy", "repo": "repo", "publisher": "jan-tdy"}
+    page.show_app(app)
+
+    from PyQt5.QtWidgets import QPushButton
+    labels = {btn.text() for btn in page.findChildren(QPushButton)}
+    assert "Choose version…" not in labels
+
+
+class _FakeReleasesResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def test_releases_loader_emits_parsed_releases(monkeypatch):
+    payload = [
+        {"tag_name": "v2.0.0", "name": "v2.0.0", "body": "## Changes\n- x",
+         "published_at": "2026-01-01T00:00:00Z"},
+        {"tag_name": "v1.0.0", "name": None, "body": None,
+         "published_at": "2025-01-01T00:00:00Z"},
+        "not-a-dict",
+        {"name": "untagged release - no tag_name, must be dropped"},
+    ]
+    monkeypatch.setattr(
+        "codemaster.widgets.requests.get",
+        lambda *a, **kw: _FakeReleasesResponse(200, payload))
+
+    loader = ReleasesLoader("jan-tdy", "repo")
+    seen = []
+    loader.loaded.connect(lambda releases: seen.append(releases))
+    loader.run()  # run synchronously in the test, no real QThread needed
+
+    assert len(seen) == 1
+    releases = seen[0]
+    assert [r["tag_name"] for r in releases] == ["v2.0.0", "v1.0.0"]
+    assert releases[0]["body"] == "## Changes\n- x"
+    assert releases[1]["name"] == "v1.0.0"  # falls back to the tag itself
+
+
+def test_releases_loader_reports_failure_on_non_200(monkeypatch):
+    monkeypatch.setattr(
+        "codemaster.widgets.requests.get",
+        lambda *a, **kw: _FakeReleasesResponse(403, {}))
+
+    loader = ReleasesLoader("jan-tdy", "repo")
+    failures = []
+    loader.failed.connect(lambda msg: failures.append(msg))
+    loader.run()
+
+    assert failures and "403" in failures[0]
+
+
+def test_version_dialog_lists_releases_and_reports_chosen_tag():
+    releases = [
+        {"tag_name": "v2.0.0", "name": "v2.0.0", "body": "notes for 2.0",
+         "published_at": ""},
+        {"tag_name": "v1.0.0", "name": "v1.0.0", "body": "notes for 1.0",
+         "published_at": ""},
+    ]
+    app = {"name": "App"}
+    dialog = VersionDialog(app, releases, installing=True)
+    assert dialog.list.count() == 2
+    dialog.list.setCurrentRow(1)
+    assert "notes for 1.0" in dialog.notes.toPlainText()
+    dialog._confirm()
+    assert dialog.chosen_tag == "v1.0.0"
+
+
+# -- changelogs (apt/snap/flatpak) ------------------------------------------- #
+def test_apt_backend_changelog_runs_apt_get_changelog(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, timeout=120):
+        calls.append((cmd, timeout))
+        return "libfoo (1.2-1) stable; urgency=medium\n\n  * Fixed things\n"
+
+    monkeypatch.setattr(system_packages, "_run", fake_run)
+    text = system_packages.AptBackend.changelog("libfoo")
+    assert calls == [(["apt-get", "changelog", "libfoo"], 30)]
+    assert "Fixed things" in text
+
+
+def test_snap_and_flatpak_backends_report_no_changelog():
+    assert system_packages.SnapBackend.changelog("some-snap") is None
+    assert system_packages.FlatpakBackend.changelog("org.some.App") is None
+
+
+def test_changelog_worker_emits_text_when_backend_has_one(monkeypatch):
+    monkeypatch.setattr(system_packages.AptBackend, "changelog",
+                        staticmethod(lambda pkg: "changelog text"))
+    worker = system_packages.ChangelogWorker("apt", "libfoo")
+    seen = []
+    worker.loaded.connect(lambda ok, text: seen.append((ok, text)))
+    worker.run()
+    assert seen == [(True, "changelog text")]
+
+
+def test_changelog_worker_reports_unavailable_for_snap():
+    worker = system_packages.ChangelogWorker("snap", "some-snap")
+    seen = []
+    worker.loaded.connect(lambda ok, text: seen.append((ok, text)))
+    worker.run()
+    assert seen[0][0] is False
+    assert "Snap" in seen[0][1]
