@@ -78,6 +78,14 @@ class CodeMaster(QMainWindow):
         self.system_upgradable = {name: set() for name in BACKENDS}
         self._system_search_results = {name: [] for name in BACKENDS}
         self._workers = set()
+        # Bumped on every load_catalog() call and stamped onto the
+        # CatalogLoader it starts — on_catalog_loaded/on_catalog_failed
+        # compare their loader's stamp against the current value and
+        # ignore the callback if it doesn't match, so a loader superseded
+        # by a newer one (e.g. save_settings() changing the username mid-
+        # scan) can never win a race and overwrite the catalog/cache with
+        # stale results.
+        self._catalog_generation = 0
         # Keys (str(repo_root)) with a GitWorker currently cloning/pulling/
         # installing deps into them — guards against a second click (or a
         # Remove) racing a running git operation on the same clone. Several
@@ -311,6 +319,8 @@ class CodeMaster(QMainWindow):
 
     # -- catalog ---------------------------------------------------------- #
     def load_catalog(self):
+        self._catalog_generation += 1
+        generation = self._catalog_generation
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("⟳ Loading…")
         # If we already have a cached catalog on screen, keep it visible and
@@ -322,15 +332,28 @@ class CodeMaster(QMainWindow):
                 "This can take up to a minute on the first run.")
         loader = CatalogLoader(self.config["username"], self.config["branch"],
                                self.config["token"], cached_apps=self.catalog)
-        loader.loaded.connect(self.on_catalog_loaded)
-        loader.failed.connect(self.on_catalog_failed)
+        loader.loaded.connect(
+            lambda apps: self.on_catalog_loaded(apps, generation))
+        loader.failed.connect(
+            lambda message: self.on_catalog_failed(message, generation))
         loader.status.connect(
-            lambda msg: self.refresh_btn.setText("⟳ " + msg[:18]))
+            lambda msg: self._on_catalog_status(msg, generation))
         loader.finished.connect(lambda: self._workers.discard(loader))
         self._workers.add(loader)
         loader.start()
 
-    def on_catalog_loaded(self, apps):
+    def _on_catalog_status(self, message, generation):
+        if generation != self._catalog_generation:
+            return
+        self.refresh_btn.setText("⟳ " + message[:18])
+
+    def on_catalog_loaded(self, apps, generation):
+        # A newer load_catalog() call (e.g. save_settings() with a changed
+        # username) has already started — this loader's results are for an
+        # account/branch that's no longer current, so they must never
+        # overwrite the catalog or its cache.
+        if generation != self._catalog_generation:
+            return
         self.catalog = apps
         save_catalog_cache(apps)
         self.refresh_btn.setEnabled(True)
@@ -338,7 +361,9 @@ class CodeMaster(QMainWindow):
         self.refresh_views()
         self._toast(f"Found {len(apps)} app(s)")
 
-    def on_catalog_failed(self, message):
+    def on_catalog_failed(self, message, generation):
+        if generation != self._catalog_generation:
+            return
         self.refresh_btn.setEnabled(True)
         self.refresh_btn.setText("⟳ Refresh")
         # Keep the cached catalog on screen if the refresh failed (e.g. offline).

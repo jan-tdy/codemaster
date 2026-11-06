@@ -44,6 +44,7 @@ def _bare_store():
     store.system_installed = {"apt": {}, "snap": {}, "flatpak": {}}
     store.system_upgradable = {"apt": set(), "snap": set(), "flatpak": set()}
     store._busy = set()
+    store._catalog_generation = 0
     return store
 
 
@@ -249,6 +250,54 @@ def test_is_installed_system_package_checks_system_installed():
     store.system_installed = {"apt": {"gimp": "2.10"}}
     assert store.is_installed({"backend": "apt", "pkg_id": "gimp"}) is True
     assert store.is_installed({"backend": "apt", "pkg_id": "inkscape"}) is False
+
+
+# -- catalog load race (issue #40) ------------------------------------------- #
+class _NoopRefreshBtn:
+    def setEnabled(self, _value):
+        pass
+
+    def setText(self, _value):
+        pass
+
+
+def _store_for_catalog_callbacks(monkeypatch):
+    store = _bare_store()
+    store.refresh_btn = _NoopRefreshBtn()
+    monkeypatch.setattr(store, "refresh_views", lambda: None)
+    monkeypatch.setattr(store, "_toast", lambda _msg: None)
+    monkeypatch.setattr("codemaster.main_window.save_catalog_cache", lambda _apps: None)
+    return store
+
+
+def test_on_catalog_loaded_ignores_results_from_a_superseded_generation(monkeypatch):
+    # Regression test for https://github.com/jan-tdy/codemaster/issues/40 —
+    # changing the GitHub username (save_settings -> load_catalog) while an
+    # older scan for the previous account is still running must not let
+    # that older, now-stale loader overwrite the catalog once it finally
+    # finishes.
+    store = _store_for_catalog_callbacks(monkeypatch)
+    store.catalog = ["current"]
+    store._catalog_generation = 2  # a newer load_catalog() already started
+    store.on_catalog_loaded(["stale"], 1)
+    assert store.catalog == ["current"]
+
+
+def test_on_catalog_loaded_applies_results_from_the_current_generation(monkeypatch):
+    store = _store_for_catalog_callbacks(monkeypatch)
+    store.catalog = []
+    store._catalog_generation = 1
+    store.on_catalog_loaded(["fresh"], 1)
+    assert store.catalog == ["fresh"]
+
+
+def test_on_catalog_failed_ignores_a_superseded_generation(monkeypatch):
+    store = _store_for_catalog_callbacks(monkeypatch)
+    store.catalog = ["current"]
+    store._catalog_generation = 2
+    store.store_grid = None  # would blow up if the stale callback tried to use it
+    store.on_catalog_failed("network error", 1)
+    assert store.catalog == ["current"]
 
 
 # -- _self_catalog_entry ---------------------------------------------------------- #
@@ -733,6 +782,25 @@ def test_sync_update_switches_branch_when_configured_branch_changed(monkeypatch)
     worker._sync_update()
     assert switched == ["dev"]
     assert cloned == []
+
+
+def test_sync_update_reclones_when_ff_only_pull_fails(monkeypatch):
+    # Regression test for https://github.com/jan-tdy/codemaster/issues/40 —
+    # after upstream history is rewritten (force-push), the depth-1 clone
+    # can never fast-forward again, so every retry would fail identically
+    # forever unless the stale clone is thrown away and re-cloned fresh.
+    worker = _bare_worker(branch="main")
+    monkeypatch.setattr(worker, "_current_branch", lambda: "main")
+
+    def _run(cmd, cwd=None):
+        if cmd[-2:] == ["pull", "--ff-only"]:
+            raise RuntimeError("fatal: Not possible to fast-forward")
+        raise AssertionError(f"unexpected command: {cmd}")
+    monkeypatch.setattr(worker, "_run", _run)
+    cloned = []
+    monkeypatch.setattr(worker, "_clone", lambda ref: cloned.append(ref))
+    worker._sync_update()
+    assert cloned == ["main"]
 
 
 # -- CatalogLoader rate limit handling ---------------------------------------- #
