@@ -269,8 +269,17 @@ class GitWorker(QThread):
         """
         if self.branch and self._current_branch() != self.branch:
             self._switch_branch(self.branch)
-        else:
+            return
+        try:
             self._run(["git", "-C", str(self.repo_root), "pull", "--ff-only"])
+        except Exception:  # noqa: BLE001
+            # The depth-1 clone's history and the remote's have diverged —
+            # most likely upstream was force-pushed (rebase, history
+            # rewrite) — so a fast-forward pull can never succeed again on
+            # this clone, no matter how many times it's retried. Re-clone
+            # fresh at the current branch, same fallback _switch_branch()
+            # already uses when a branch switch can't be reconciled.
+            self._clone(self.branch or self._current_branch())
 
     def run(self):
         """Execute the requested repository operation and emit its result.
