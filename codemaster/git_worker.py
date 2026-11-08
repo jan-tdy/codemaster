@@ -53,7 +53,7 @@ class GitWorker(QThread):
     done = pyqtSignal(bool, str, str)  # ok, message, resolved commit SHA
 
     def __init__(self, action, username, repo, repo_root, branch,
-                 req_path=None, method="sync", release_tag=None, token=""):
+                 req_path=None, method="sync", release_tag=None, token="", target_commit=""):
         """``username`` is the app's *publisher* (GitHub owner of ``repo``)
         — for community-catalog apps this can be anyone, not just the
         configured GitHub account."""
@@ -67,6 +67,8 @@ class GitWorker(QThread):
         self.method = method
         self.release_tag = release_tag
         self.token = token
+        self.target_commit = target_commit
+        self.previous_commit = ""
 
     def _run(self, cmd, cwd=None, timeout=None):
         """Run a command, raising an error when it exits unsuccessfully.
@@ -121,7 +123,7 @@ class GitWorker(QThread):
         env["GIT_CONFIG_COUNT"] = str(config_count + 1)
         return env
 
-    def _clone(self, ref):
+    def _clone(self, ref, preserve_previous=False):
         """Fresh shallow clone of the repo at a branch or tag."""
         url = f"https://github.com/{self.username}/{self.repo}.git"
         self.repo_root.parent.mkdir(parents=True, exist_ok=True)
@@ -135,6 +137,7 @@ class GitWorker(QThread):
         cmd += [url, str(clone_root)]
 
         backup_root = clone_root.with_name(f"{clone_root.name}-old")
+        stable_backup = self.repo_root.with_name(f"{self.repo_root.name}-old")
         try:
             self._run(cmd)
             had_existing_repo = self.repo_root.exists() or \
@@ -148,7 +151,13 @@ class GitWorker(QThread):
                     backup_root.replace(self.repo_root)
                 raise
             if had_existing_repo:
-                if backup_root.is_dir() and not backup_root.is_symlink():
+                if preserve_previous:
+                    if stable_backup.is_dir() and not stable_backup.is_symlink():
+                        shutil.rmtree(stable_backup, ignore_errors=True)
+                    else:
+                        stable_backup.unlink(missing_ok=True)
+                    backup_root.replace(stable_backup)
+                elif backup_root.is_dir() and not backup_root.is_symlink():
                     shutil.rmtree(backup_root, ignore_errors=True)
                 else:
                     backup_root.unlink(missing_ok=True)
@@ -185,6 +194,21 @@ class GitWorker(QThread):
                        "-B", branch, f"origin/{branch}"])
         except Exception:  # noqa: BLE001
             self._clone(branch)
+
+    def _checkout_commit(self, commit):
+        """Check out a prior installed commit, fetching it when necessary."""
+        if not commit:
+            raise RuntimeError("No previous version is recorded")
+        repo = str(self.repo_root)
+        present = subprocess.run(["git", "-C", repo, "cat-file", "-e", f"{commit}^{{commit}}"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        if not present:
+            backup = self.repo_root.with_name(f"{self.repo_root.name}-old")
+            if (backup / ".git").exists():
+                self._run(["git", "-C", repo, "fetch", str(backup), commit])
+            else:
+                self._run(["git", "-C", repo, "fetch", "--depth", "1", "origin", commit])
+        self._run(["git", "-C", repo, "checkout", "--detach", commit])
 
     def _head_commit(self):
         """The commit actually checked out in repo_root right now."""
@@ -289,6 +313,7 @@ class GitWorker(QThread):
         dependencies. Failures are reported through the completion signal.
         """
         try:
+            self.previous_commit = self._head_commit()
             # A missing release tag means the release lookup failed. Never
             # fall through to branch sync for a release-pinned installation.
             if self.method == "release" and not self.release_tag:
@@ -299,7 +324,7 @@ class GitWorker(QThread):
             if self.action in ("install", "update"):
                 if release:
                     # Tags can't be fast-forwarded — re-clone at the new tag.
-                    self._clone(self.release_tag)
+                    self._clone(self.release_tag, preserve_previous=self.action == "update")
                 elif self.action == "install" and \
                         not (self.repo_root / ".git").exists():
                     self._clone(self.branch)
@@ -312,6 +337,14 @@ class GitWorker(QThread):
                 self.done.emit(
                     True, "Installed" if self.action == "install"
                     else "Updated", self._head_commit())
+            elif self.action == "rollback":
+                if self.method == "release":
+                    if not self.release_tag:
+                        raise RuntimeError("No previous release version is recorded")
+                    self._clone(self.release_tag, preserve_previous=True)
+                else:
+                    self._checkout_commit(self.target_commit)
+                self.done.emit(True, "Rolled back", self._head_commit())
             elif self.action == "deps":
                 self._install_deps()
                 self.done.emit(True, "Dependencies installed", "")
