@@ -707,6 +707,11 @@ class DetailsPage(QScrollArea):
                 actions.append(("Install deps", "Ghost", c.install_deps, True))
             if versioned:
                 actions.append(("Choose version…", "Ghost", self._choose_version, True))
+            rec = c.installed.get(app.get("key"), {})
+            actions.append(("Unpin version" if rec.get("pinned") else "Pin version",
+                            "Ghost", c.toggle_pin, False))
+            if rec.get("previous_commit") or rec.get("previous_version"):
+                actions.append(("Revert to previous version", "Ghost", c.rollback_app, True))
         else:
             actions.append(("Changelog", "Ghost", self._show_changelog, False))
         actions.append(("Remove", "Ghost", c.uninstall_app, True))
