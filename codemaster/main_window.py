@@ -99,6 +99,8 @@ class CodeMaster(QMainWindow):
         # it's popped.
         self._update_queue = []
         self._update_all_running = False
+        self._background_check_pending = False
+        self._background_update_snapshot = set()
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -148,6 +150,10 @@ class CodeMaster(QMainWindow):
         # (icon decoding per app), check Code Master's own update status (a
         # synchronous `git rev-parse`), and kick off the catalog/system-
         # package scans.
+        self._background_update_timer = QTimer(self)
+        self._background_update_timer.setInterval(4 * 60 * 60 * 1000)
+        self._background_update_timer.timeout.connect(self._check_updates_background)
+        self._background_update_timer.start()
         QTimer.singleShot(0, self._start_up)
 
     def _start_up(self):
@@ -347,6 +353,30 @@ class CodeMaster(QMainWindow):
             return
         self.refresh_btn.setText("⟳ " + message[:18])
 
+    def _check_updates_background(self):
+        if self._background_check_pending or not self.refresh_btn.isEnabled():
+            return
+        self._background_update_snapshot = {
+            app["key"] for app in self._installed_apps()
+            if app.get("backend", "git") == "git" and self.has_update(app)
+        }
+        self._background_check_pending = True
+        self.load_catalog()
+
+    def _notify_new_updates(self, apps):
+        if not apps:
+            return
+        names = ", ".join(app.get("name", app["key"]) for app in apps[:4])
+        if len(apps) > 4:
+            names += f" and {len(apps) - 4} more"
+        body = f"Updates are available for {names}."
+        notify_send = shutil.which("notify-send")
+        if notify_send:
+            subprocess.Popen([notify_send, APP_NAME, body],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            self._toast(body)
+
     def on_catalog_loaded(self, apps, generation):
         # A newer load_catalog() call (e.g. save_settings() with a changed
         # username) has already started — this loader's results are for an
@@ -359,6 +389,13 @@ class CodeMaster(QMainWindow):
         self.refresh_btn.setEnabled(True)
         self.refresh_btn.setText("⟳ Refresh")
         self.refresh_views()
+        if self._background_check_pending:
+            new_apps = [app for app in self._installed_apps()
+                        if app.get("backend", "git") == "git"
+                        and self.has_update(app)
+                        and app["key"] not in self._background_update_snapshot]
+            self._background_check_pending = False
+            self._notify_new_updates(new_apps)
         self._toast(f"Found {len(apps)} app(s)")
 
     def on_catalog_failed(self, message, generation):
@@ -367,6 +404,7 @@ class CodeMaster(QMainWindow):
         self.refresh_btn.setEnabled(True)
         self.refresh_btn.setText("⟳ Refresh")
         # Keep the cached catalog on screen if the refresh failed (e.g. offline).
+        self._background_check_pending = False
         if self.catalog:
             self._toast(f"Refresh failed, showing cached apps: {message}")
         else:
@@ -523,7 +561,7 @@ class CodeMaster(QMainWindow):
             # DetailsPage._actions).
             return app.get("pkg_id") in self.system_upgradable.get(backend, set())
         rec = self.installed.get(app["key"])
-        if not rec:
+        if not rec or rec.get("pinned", False):
             return False
         catalog = next((a for a in self.catalog if a["key"] == app["key"]), None)
         if not catalog:
@@ -542,6 +580,16 @@ class CodeMaster(QMainWindow):
         if not latest:
             return False
         return latest != str(rec.get("version", ""))
+
+    def toggle_pin(self, app):
+        app = self._resolve(app)
+        rec = self.installed.get(app["key"])
+        if not rec:
+            return
+        rec["pinned"] = not rec.get("pinned", False)
+        save_installed(self.installed)
+        self.refresh_views()
+        self._toast(f"{app.get('name', app['key'])} " + ("pinned" if rec["pinned"] else "unpinned"))
 
     def has_launcher(self, app):
         return self._launcher_path(app).exists()
@@ -686,6 +734,7 @@ class CodeMaster(QMainWindow):
                 "requirements": app.get("requirements"),
                 "mime_types": app.get("mime_types") or [],
                 "update_method": app.get("update_method", "sync"),
+                "branch": app.get("branch", self.config["branch"]),
                 "repo_root": str(repo_root), "source": "store",
             }
             save_installed(self.installed)
@@ -726,6 +775,10 @@ class CodeMaster(QMainWindow):
             if on_done:
                 on_done()
             return
+        prior_versions = {key: (inst.get("commit", ""), inst.get("version", ""))
+                          for key, inst in self.installed.items()
+                          if inst.get("repo") == app["repo"] and
+                          inst.get("publisher", self.config["username"]) == publisher}
         worker = GitWorker("update", publisher, app["repo"], repo_root,
                            app.get("branch", self.config["branch"]),
                            method=method, release_tag=tag,
@@ -753,6 +806,9 @@ class CodeMaster(QMainWindow):
                     # the catalog's own latest-release figure — otherwise a
                     # deliberate downgrade would be overwritten right back
                     # to "latest" the moment this finishes.
+                    old_commit, old_version = prior_versions.get(key, ("", ""))
+                    inst["previous_commit"] = old_commit
+                    inst["previous_version"] = old_version
                     inst["version"] = tag if (release_tag and
                                               cat.get("update_method") == "release") \
                         else self.effective_version(cat)
@@ -776,6 +832,48 @@ class CodeMaster(QMainWindow):
         worker.start()
         self.refresh_views()
         self._toast(f"Updating {app['name']}…")
+
+    def rollback_app(self, app):
+        app = self._resolve(app)
+        rec = self.installed.get(app.get("key"))
+        if not rec:
+            return
+        method = rec.get("update_method", "sync")
+        target_commit = rec.get("previous_commit", "")
+        target_version = rec.get("previous_version", "")
+        if (method == "release" and not target_version) or (method != "release" and not target_commit):
+            self._toast("No previous version is recorded for this app")
+            return
+        repo_root = self._repo_root(app)
+        busy_key = str(repo_root)
+        if busy_key in self._busy:
+            self._toast(f"{app.get('name', app['key'])} already has an operation in progress")
+            return
+        publisher = rec.get("publisher", self.config["username"])
+        worker = GitWorker("rollback", publisher, rec["repo"], repo_root,
+                           rec.get("branch", self.config["branch"]), method=method,
+                           release_tag=target_version if method == "release" else None,
+                           target_commit=target_commit, token=self.config["token"])
+        self._busy.add(busy_key)
+        def finished(ok, msg, commit=""):
+            self._workers.discard(worker)
+            self._busy.discard(busy_key)
+            if not ok:
+                QMessageBox.warning(self, "Rollback failed", msg)
+                return
+            for inst in self.installed.values():
+                if inst.get("repo") == rec.get("repo") and inst.get("publisher", self.config["username"]) == publisher:
+                    inst["previous_commit"] = worker.previous_commit
+                    inst["previous_version"] = inst.get("version", "")
+                    inst["commit"] = commit
+                    if method == "release":
+                        inst["version"] = target_version
+            save_installed(self.installed)
+            self.refresh_views()
+            self._toast(f"Rolled back {app.get('name', app['key'])}")
+        worker.done.connect(finished)
+        self._workers.add(worker)
+        worker.start()
 
     def update_all(self):
         """Update every app currently listed in the Updates tab, one at a

@@ -59,6 +59,11 @@ publishes the Telescope Cover, Astrofoto, Atacama (C14) and DSLR apps.
   update. Flatpak isn't probed — its **Update** button stays always
   available once installed instead (its own package manager decides
   whether there's anything to do).
+- **📌 Pin and rollback** — pin an installed git app to suppress update offers,
+  and revert it to the previous version after an update. Release apps can
+  also choose any published version from the version picker.
+- **🔔 Background update checks** — Code Master refreshes its catalog every
+  four hours and sends a desktop notification when a new update appears.
 - **🏷 Choose version** — for `release` apps published straight from a
   [jan-tdy](https://github.com/jan-tdy) repository (not community catalog
   submissions), a **Choose version…** button on the details page lists
