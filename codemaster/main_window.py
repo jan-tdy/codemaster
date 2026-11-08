@@ -734,6 +734,7 @@ class CodeMaster(QMainWindow):
                 "requirements": app.get("requirements"),
                 "mime_types": app.get("mime_types") or [],
                 "update_method": app.get("update_method", "sync"),
+                "branch": app.get("branch", self.config["branch"]),
                 "repo_root": str(repo_root), "source": "store",
             }
             save_installed(self.installed)
