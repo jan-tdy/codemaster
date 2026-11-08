@@ -176,7 +176,7 @@ class GitWorker(QThread):
         except Exception:  # noqa: BLE001
             return ""
 
-    def _switch_branch(self, branch):
+    def _switch_branch(self, branch, preserve_previous=False):
         """Move an existing clone onto ``branch``.
 
         Clones are shallow (``--depth 1 --branch <branch>``), so the other
@@ -193,7 +193,7 @@ class GitWorker(QThread):
             self._run(["git", "-C", str(self.repo_root), "checkout",
                        "-B", branch, f"origin/{branch}"])
         except Exception:  # noqa: BLE001
-            self._clone(branch)
+            self._clone(branch, preserve_previous=preserve_previous)
 
     def _checkout_commit(self, commit):
         """Check out a prior installed commit, fetching it when necessary."""
@@ -283,7 +283,7 @@ class GitWorker(QThread):
                 f"Install manually with:\n    sudo apt install {packages}"
             ) from exc
 
-    def _sync_update(self):
+    def _sync_update(self, preserve_previous=False):
         """Update an already-cloned sync app in place.
 
         Reconciles the clone with ``self.branch`` (the configured metadata
@@ -292,7 +292,7 @@ class GitWorker(QThread):
         out, silently ignoring a branch change made after install.
         """
         if self.branch and self._current_branch() != self.branch:
-            self._switch_branch(self.branch)
+            self._switch_branch(self.branch, preserve_previous=preserve_previous)
             return
         try:
             self._run(["git", "-C", str(self.repo_root), "pull", "--ff-only"])
@@ -303,7 +303,7 @@ class GitWorker(QThread):
             # this clone, no matter how many times it's retried. Re-clone
             # fresh at the current branch, same fallback _switch_branch()
             # already uses when a branch switch can't be reconciled.
-            self._clone(self.branch or self._current_branch())
+            self._clone(self.branch or self._current_branch(), preserve_previous=preserve_previous)
 
     def run(self):
         """Execute the requested repository operation and emit its result.
@@ -329,7 +329,7 @@ class GitWorker(QThread):
                         not (self.repo_root / ".git").exists():
                     self._clone(self.branch)
                 else:
-                    self._sync_update()
+                    self._sync_update(preserve_previous=self.action == "update")
                 # Report the commit Git actually checked out, not the SHA
                 # the catalog scan saw before this ran — the branch may have
                 # advanced (or a release re-clone lands on a different
