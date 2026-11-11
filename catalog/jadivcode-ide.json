@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "publisher": "JadivCode",
+  "repo": "jadivcode-ide",
+  "branch": "main",
+  "homepage": "https://jadivcode.github.io/tools/ide/",
+  "apps": [
+    {
+      "id": "jadivcode-ide",
+      "name": "JadivCode IDE",
+      "tagline": "Editor, block builder and window designer for JadivCode",
+      "description": "A desktop editor for the JadivCode language: syntax colors, live checking with one-click fixes, a run console, a searchable help panel, a block editor for building programs with the mouse, and designers for windows and web pages. Install the JadivCode app first; the IDE uses its interpreter.",
+      "category": "Developer Tools",
+      "version": "0.1.0",
+      "author": "JapySoft",
+      "icon": "assets/jadivcode-ide.svg",
+      "subdir": ".",
+      "entrypoint": "main.py",
+      "run": "python3 main.py",
+      "requirements": "requirements.txt",
+      "update_method": "sync",
+      "maintained": true,
+      "mime_types": ["text/x-jadivcode"]
+    }
+  ]
+}
