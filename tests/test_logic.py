@@ -264,6 +264,9 @@ class _NoopRefreshBtn:
 def _store_for_catalog_callbacks(monkeypatch):
     store = _bare_store()
     store.refresh_btn = _NoopRefreshBtn()
+    # on_catalog_loaded() reads this flag; __init__ (which sets it) is not
+    # run for a bare store.
+    store._background_check_pending = False
     monkeypatch.setattr(store, "refresh_views", lambda: None)
     monkeypatch.setattr(store, "_toast", lambda _msg: None)
     monkeypatch.setattr("codemaster.main_window.save_catalog_cache", lambda _apps: None)
@@ -731,9 +734,11 @@ def test_update_re_clones_when_the_branch_switch_fails():
         raise RuntimeError("your local changes would be overwritten")
 
     worker._run = failing_run
-    worker._clone = cloned.append
+    worker._clone = lambda ref, preserve_previous=False: cloned.append((ref, preserve_previous))
     worker._switch_branch("beta")
-    assert cloned == ["beta"]
+    assert cloned == [("beta", False)]
+    worker._switch_branch("beta", preserve_previous=True)
+    assert cloned == [("beta", False), ("beta", True)]
 
 
 def test_current_branch_reads_the_checked_out_branch():
@@ -776,11 +781,16 @@ def test_sync_update_switches_branch_when_configured_branch_changed(monkeypatch)
     worker = _bare_worker(branch="dev")
     monkeypatch.setattr(worker, "_current_branch", lambda: "main")
     switched = []
-    monkeypatch.setattr(worker, "_switch_branch", lambda branch: switched.append(branch))
+    monkeypatch.setattr(
+        worker, "_switch_branch",
+        lambda branch, preserve_previous=False: switched.append((branch, preserve_previous)))
     cloned = []
-    monkeypatch.setattr(worker, "_clone", lambda ref: cloned.append(ref))
+    monkeypatch.setattr(worker, "_clone",
+                        lambda ref, preserve_previous=False: cloned.append(ref))
     worker._sync_update()
-    assert switched == ["dev"]
+    assert switched == [("dev", False)]
+    worker._sync_update(preserve_previous=True)
+    assert switched == [("dev", False), ("dev", True)]
     assert cloned == []
 
 
@@ -798,9 +808,13 @@ def test_sync_update_reclones_when_ff_only_pull_fails(monkeypatch):
         raise AssertionError(f"unexpected command: {cmd}")
     monkeypatch.setattr(worker, "_run", _run)
     cloned = []
-    monkeypatch.setattr(worker, "_clone", lambda ref: cloned.append(ref))
+    monkeypatch.setattr(
+        worker, "_clone",
+        lambda ref, preserve_previous=False: cloned.append((ref, preserve_previous)))
     worker._sync_update()
-    assert cloned == ["main"]
+    assert cloned == [("main", False)]
+    worker._sync_update(preserve_previous=True)
+    assert cloned == [("main", False), ("main", True)]
 
 
 # -- CatalogLoader rate limit handling ---------------------------------------- #
