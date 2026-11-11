@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "publisher": "JadivCode",
+  "repo": "jadivcode",
+  "branch": "main",
+  "homepage": "https://jadivcode.github.io",
+  "apps": [
+    {
+      "id": "jadivcode",
+      "name": "JadivCode",
+      "tagline": "A super simple programming language for Linux",
+      "description": "JadivCode is a line-based programming language whose programs read almost like sentences. It can switch Raspberry Pi pins, open windows, serve web pages and call webhooks, and it checks programs for mistakes and unsafe code before running them. Opening this app runs its installer, which puts the 'jadivcode' command into ~/.local/bin without sudo. Then run programs with: jadivcode run file.jdv",
+      "category": "Developer Tools",
+      "version": "0.1.0",
+      "author": "JapySoft",
+      "icon": null,
+      "subdir": ".",
+      "entrypoint": "install.sh",
+      "run": "bash install.sh",
+      "update_method": "sync",
+      "maintained": true
+    }
+  ]
+}
