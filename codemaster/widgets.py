@@ -425,9 +425,10 @@ class ReadmeLoader(QThread):
 
 
 class ReleasesLoader(QThread):
-    """Fetch a jan-tdy repo's published GitHub releases (tag, name, notes),
-    off the UI thread — used by the version picker, which needs the full
-    list rather than just the latest tag the catalog scan already has."""
+    """Fetch a repo's published GitHub releases (tag, name, notes), off the
+    UI thread — used by the version picker, which needs the full list
+    rather than just the latest tag the catalog scan already has. Works for
+    any publisher/repo, including community catalog submissions."""
     loaded = pyqtSignal(list)  # [{"tag_name", "name", "body", "published_at"}, ...]
     failed = pyqtSignal(str)
 
@@ -464,8 +465,8 @@ class ReleasesLoader(QThread):
 
 
 class VersionDialog(QDialog):
-    """Pick a published release of a jan-tdy app to install/update to,
-    showing that release's own notes as its changelog."""
+    """Pick a published release of an app to install/update to, showing
+    that release's own notes as its changelog."""
 
     def __init__(self, app, releases, installing, parent=None):
         super().__init__(parent)
@@ -673,11 +674,13 @@ class DetailsPage(QScrollArea):
         c = self.controller
         installed = c.is_installed(app)
         # Picking a specific version only makes sense for release-tagged
-        # apps published straight from jan-tdy's own repos — community
-        # submissions and sync apps have no tag history to choose from.
+        # apps — they have GitHub releases to list. 'sync' apps track a
+        # branch's latest commit instead and have no tag history to choose
+        # from. Community catalog apps can be release-tagged too (the
+        # catalog scan already fetches their release tag the same way),
+        # so they get the picker as well.
         versioned = (app.get("backend") == "git"
-                    and app.get("update_method") == "release"
-                    and app.get("catalog_source") == "jan-tdy")
+                    and app.get("update_method") == "release")
         actions = []
         if not installed:
             actions.append(("Install", "Primary", c.install_app, True))
@@ -719,7 +722,7 @@ class DetailsPage(QScrollArea):
             actions.append(("Homepage", "Ghost", c.open_homepage, False))
         return actions
 
-    # -- version picker (jan-tdy release apps) ----------------------------- #
+    # -- version picker (release apps) -------------------------------------- #
     def _choose_version(self, app):
         token = self.controller.config.get("token", "")
         self._versions_btn_app = app

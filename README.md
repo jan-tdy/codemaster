@@ -64,9 +64,9 @@ publishes the Telescope Cover, Astrofoto, Atacama (C14) and DSLR apps.
   also choose any published version from the version picker.
 - **🔔 Background update checks** — Code Master refreshes its catalog every
   four hours and sends a desktop notification when a new update appears.
-- **🏷 Choose version** — for `release` apps published straight from a
-  [jan-tdy](https://github.com/jan-tdy) repository (not community catalog
-  submissions), a **Choose version…** button on the details page lists
+- **🏷 Choose version** — for `release` apps, whether published from a
+  [jan-tdy](https://github.com/jan-tdy) repository or submitted through the
+  community catalog, a **Choose version…** button on the details page lists
   every published GitHub release with its own release notes, so you can
   install — or roll back to — a specific version instead of always the
   latest. A manually picked version still shows up in **Updates** once a
