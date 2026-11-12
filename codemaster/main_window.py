@@ -690,8 +690,8 @@ class CodeMaster(QMainWindow):
     def install_app(self, app, release_tag=None):
         """``release_tag``, when given, pins a "release"-method app to a
         specific published tag instead of whatever the catalog scan last
-        saw as latest — how the version picker (jan-tdy repos only) drives
-        an install of a chosen version."""
+        saw as latest — how the version picker drives an install of a
+        chosen version."""
         if app.get("backend", "git") != "git":
             self._install_system_package(app)
             return
@@ -750,8 +750,8 @@ class CodeMaster(QMainWindow):
     def update_app(self, app, on_done=None, release_tag=None):
         """``release_tag``, when given, pins a "release"-method app to a
         specific published tag instead of the catalog's latest — how the
-        version picker (jan-tdy repos only) drives an update to a chosen
-        version, including downgrading to an older one."""
+        version picker drives an update to a chosen version, including
+        downgrading to an older one."""
         if app.get("backend", "git") != "git":
             self._update_system_package(app, on_done=on_done)
             return

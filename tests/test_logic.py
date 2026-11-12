@@ -1776,7 +1776,7 @@ def test_format_version_empty_stays_empty():
     assert format_version(None) == ""
 
 
-# -- version picker (jan-tdy release apps only) ----------------------------- #
+# -- version picker (release apps) ------------------------------------------- #
 def test_details_page_offers_choose_version_for_jan_tdy_release_app(monkeypatch):
     def no_network(*_a, **_kw):
         raise requests.RequestException("no network in tests")
@@ -1794,7 +1794,7 @@ def test_details_page_offers_choose_version_for_jan_tdy_release_app(monkeypatch)
     assert "Choose version…" in labels
 
 
-def test_details_page_hides_choose_version_for_community_release_app(monkeypatch):
+def test_details_page_offers_choose_version_for_community_release_app(monkeypatch):
     def no_network(*_a, **_kw):
         raise requests.RequestException("no network in tests")
     monkeypatch.setattr("codemaster.widgets.requests.get", no_network)
@@ -1808,10 +1808,10 @@ def test_details_page_hides_choose_version_for_community_release_app(monkeypatch
 
     from PyQt5.QtWidgets import QPushButton
     labels = {btn.text() for btn in page.findChildren(QPushButton)}
-    assert "Choose version…" not in labels
+    assert "Choose version…" in labels
 
 
-def test_details_page_hides_choose_version_for_sync_jan_tdy_app(monkeypatch):
+def test_details_page_hides_choose_version_for_sync_app(monkeypatch):
     def no_network(*_a, **_kw):
         raise requests.RequestException("no network in tests")
     monkeypatch.setattr("codemaster.widgets.requests.get", no_network)
