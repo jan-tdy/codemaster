@@ -19,7 +19,11 @@ def read_json(path, default, *, preserve_invalid=False):
             value = json.load(fh)
     except FileNotFoundError:
         return default
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+    except OSError:
+        if preserve_invalid:
+            raise
+        return default
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         if not preserve_invalid:
             return default
         value = None
