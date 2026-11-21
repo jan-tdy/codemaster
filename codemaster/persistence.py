@@ -3,6 +3,8 @@
 import json
 import os
 import tempfile
+import time
+import warnings
 from pathlib import Path
 
 from .constants import (
@@ -11,12 +13,37 @@ from .constants import (
 )
 
 
-def read_json(path, default):
+def read_json(path, default, *, preserve_invalid=False):
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:
+            value = json.load(fh)
+    except FileNotFoundError:
         return default
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        if not preserve_invalid:
+            return default
+        value = None
+        reason = str(exc)
+    else:
+        if isinstance(value, dict):
+            return value
+        if not preserve_invalid:
+            return value
+        reason = f"expected an object, got {type(value).__name__}"
+
+    # Keep the damaged file for recovery instead of letting a later save
+    # silently replace the user's settings or installed-app registry.
+    corrupt_path = path.with_name(f"{path.name}.corrupt-{time.time_ns()}")
+    try:
+        path.replace(corrupt_path)
+    except OSError as exc:
+        warnings.warn(f"Could not preserve invalid JSON at {path}: {exc}", RuntimeWarning)
+        return default
+    warnings.warn(
+        f"Invalid JSON at {path} ({reason}); preserved as {corrupt_path}",
+        RuntimeWarning,
+    )
+    return default
 
 
 def write_json(path, data, mode=None):
@@ -58,7 +85,7 @@ def load_config():
             CONFIG_FILE.chmod(0o600)
     except OSError:
         pass
-    cfg = read_json(CONFIG_FILE, {})
+    cfg = read_json(CONFIG_FILE, {}, preserve_invalid=True)
     cfg.setdefault("username", DEFAULT_USERNAME)
     cfg.setdefault("branch", DEFAULT_BRANCH)
     cfg.setdefault("token", "")
@@ -81,7 +108,7 @@ def save_config(cfg):
 
 
 def load_installed():
-    return read_json(INSTALLED_FILE, {})
+    return read_json(INSTALLED_FILE, {}, preserve_invalid=True)
 
 
 def save_installed(data):
