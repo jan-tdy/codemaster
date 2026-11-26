@@ -3,9 +3,15 @@
 import shlex
 
 
+def desktop_entry_value(value):
+    """Remove control characters that cannot appear in a Desktop Entry value."""
+    return "".join(" " if ord(char) < 32 or ord(char) == 127 else char for char in str(value)).strip()
+
+
 def desktop_exec_quote(s):
     """Escape a string for embedding inside a double-quoted Exec= value,
     per the Desktop Entry Specification's quoting rules."""
+    s = desktop_entry_value(s).replace("%", "%%")
     return (s.replace("\\", "\\\\").replace("`", "\\`")
              .replace("$", "\\$").replace('"', '\\"'))
 

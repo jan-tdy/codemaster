@@ -23,7 +23,7 @@ from .constants import (
     DEFAULT_BRANCH, DEFAULT_USERNAME, DESKTOP_CATEGORIES, LAUNCHER_ICON_DIR,
     METADATA_FILE, SELF_DIR,
 )
-from .desktop_entry import desktop_exec_line
+from .desktop_entry import desktop_entry_value, desktop_exec_line
 from .git_worker import GitWorker
 from .icons import pixmap_from_bytes, placeholder_pixmap
 from .persistence import (
@@ -1103,7 +1103,7 @@ class CodeMaster(QMainWindow):
             return
         if not self._confirm_run(app, run):
             return
-        cwd = os.path.normpath(str(cwd))
+        cwd = desktop_entry_value(os.path.normpath(str(cwd)))
 
         # Render the app's icon to a stable PNG the .desktop file can point at.
         LAUNCHER_ICON_DIR.mkdir(parents=True, exist_ok=True)
@@ -1115,21 +1115,24 @@ class CodeMaster(QMainWindow):
         # Keep the Path key for desktop environments that honour it, but make
         # Exec self-contained (see desktop_exec_line) so the launcher also
         # works on the ones that don't.
-        mime_types = app.get("mime_types") or []
+        mime_types = [desktop_entry_value(value) for value in (app.get("mime_types") or [])]
         exec_line = desktop_exec_line(cwd, run, mime_types)
-        categories = DESKTOP_CATEGORIES.get(app.get("category", ""), "Utility;")
-        # Comment must be a single line per the Desktop Entry Spec.
-        comment = (app.get("tagline")
-                   or app.get("description", "")).replace("\n", " ")
+        categories = desktop_entry_value(
+            DESKTOP_CATEGORIES.get(app.get("category", ""), "Utility;")
+        )
+        name = desktop_entry_value(app.get("name", app["key"]))
+        comment = desktop_entry_value(
+            app.get("tagline") or app.get("description", "")
+        )
         content = (
             "[Desktop Entry]\n"
             "Type=Application\n"
             "Version=1.0\n"
-            f"Name={app.get('name', app['key'])}\n"
+            f"Name={name}\n"
             f"Comment={comment}\n"
             f"Exec={exec_line}\n"
             f"Path={cwd}\n"
-            f"Icon={icon_png}\n"
+            f"Icon={desktop_entry_value(icon_png)}\n"
             "Terminal=false\n"
             f"Categories={categories}\n"
         )
@@ -1137,7 +1140,7 @@ class CodeMaster(QMainWindow):
             content += f"MimeType={';'.join(mime_types)};\n"
         content += (
             "StartupNotify=true\n"
-            f"X-CodeMaster-Key={app['key']}\n"
+            f"X-CodeMaster-Key={desktop_entry_value(app['key'])}\n"
         )
         try:
             APPLICATIONS_DIR.mkdir(parents=True, exist_ok=True)
